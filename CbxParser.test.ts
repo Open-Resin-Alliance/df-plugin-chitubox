@@ -38,15 +38,29 @@ function buildChainBlob(opts?: {
   const tipBot = -5.0;
   const tipTop = -1.0; // contact; world 9.0
 
-  const records: Array<[number, number, number, number, number, number, number, number]> = [];
-  // [sub, x, y, topZ, botZ, paramA, paramB, extra]
+  /**
+   * [sub, x, y, topZ, botZ, paramA, paramB, extra, x2?, y2?]
+   *
+   * x2/y2 are the record's SECOND endpoint. They default to x/y (a vertical
+   * record). For a cone the second endpoint is the SOCKET where it meets the
+   * structure, and the first is the model contact; measured across the corpus,
+   * 100% of 21,764 sub-1 sockets sit within 0.05mm of a pillar endpoint, so a
+   * tip must be authored with its socket ON the pillar even when its contact
+   * is offset. The graph emitter sockets tips by P2 for exactly this reason.
+   */
+  const records: Array<
+    [number, number, number, number, number, number, number, number, number?, number?]
+  > = [];
   records.push([6, 0, 0, -1e8, -1e9, 1, 1, 0]); // summary (must be skipped)
   if (withBase) records.push([4, 5, 5, pillarBot, RAFT_BOT, 0.65, 1.95, 0]); // base pad
   records.push([3, 5, 5, pillarTop, pillarBot, 0.65, 0.65, 0]); // pillar (paramA*2 = 1.3)
-  records.push([9, 5, 5, knotTop, knotBot, 0.676, 0.676, 0]); // knot (diameter via topZ-botZ = 1.2)
-  records.push([1, 4, 4, tipTop, tipBot, 0.175, 0.45, 0.2]); // primary tip (cD 0.35, bD 0.90)
+  // A sphere is a diameter segment: paramA*2 == |topZ-botZ|. 96.2% of the
+  // corpus's 15,768 sphere records agree, so author it consistently at 1.2.
+  records.push([9, 5, 5, knotTop, knotBot, 0.6, 0.6, 0]); // knot (diameter 1.2)
+  // Contact offset from the pillar, socket ON it (see the x2/y2 note above).
+  records.push([1, 4, 4, tipTop, tipBot, 0.175, 0.45, 0.2, 5, 5]); // primary tip (cD 0.35, bD 0.90)
   for (const t of opts?.extraTips ?? []) {
-    records.push([1, t.x, t.y, t.contactZ, tipBot, t.cD / 2, t.bD / 2, 0.2]);
+    records.push([1, t.x, t.y, t.contactZ, tipBot, t.cD / 2, t.bD / 2, 0.2, 5, 5]);
   }
 
   // Build a single-instance container using the VERIFIED record layout:
@@ -83,7 +97,10 @@ function buildChainBlob(opts?: {
   const u8 = new Uint8Array(buf);
   dv.setUint32(0, MAGIC, true);
   dv.setUint32(4, 1, true); // nInstances
-  dv.setUint32(424, meshOffset, true);
+  dv.setUint32(8, recStart, true); // field8: absolute record-table offset
+  dv.setUint32(12, 412, true); // field12: pointer-block base
+  dv.setUint32(412 + 8, 444, true); // table delta
+  dv.setUint32(412 + 12, meshOffset, true); // mesh-section offset
 
   // Filename + record tail.
   for (let i = 0; i < fname.length; i++) u8[recStart + i] = fname.charCodeAt(i);
@@ -96,18 +113,19 @@ function buildChainBlob(opts?: {
   u8[tailOff + 26] = 0x4e; // terminator marker (last two bytes 0x4E 0xFF)
   u8[tailOff + 27] = 0xff;
 
-  records.forEach(([sub, x, y, topZ, botZ, a, b, extra], i) => {
+  records.forEach(([sub, x, y, topZ, botZ, a, b, extra, x2, y2], i) => {
     const off = recBase + i * REC;
     dv.setUint32(off + 0, TAG, true);
     dv.setUint32(off + 4, sub, true);
     dv.setFloat32(off + 8, x, true);
     dv.setFloat32(off + 12, y, true);
     dv.setFloat32(off + 16, topZ, true);
-    // Second endpoint (+20/+24) equals the first for a vertical pillar/tip; a
-    // brace would differ here. Writing it explicitly avoids a 0,0 default that
-    // would misclassify the record as a diagonal brace.
-    dv.setFloat32(off + 20, x, true);
-    dv.setFloat32(off + 24, y, true);
+    // Second endpoint (+20/+24). Defaults to the first, which is what a vertical
+    // pillar authors; writing it explicitly avoids a 0,0 default that would
+    // misclassify the record as a diagonal brace. A cone overrides it to place
+    // its socket on the pillar.
+    dv.setFloat32(off + 20, x2 ?? x, true);
+    dv.setFloat32(off + 24, y2 ?? y, true);
     dv.setFloat32(off + 28, botZ, true);
     dv.setFloat32(off + 32, a, true);
     dv.setFloat32(off + 36, b, true);
@@ -168,8 +186,10 @@ describe('CbxParser.parseBuffer — chain model', () => {
   it('computes authored tip length = contactZ − attachZ', () => {
     const { buffer } = buildChainBlob();
     const tip = CbxParser.parseBuffer(buffer, 'c').models[0].supports[0].tips[0];
-    // raw tip topZ -1.0, botZ -5.0 → length 4.0
-    assert.ok(Math.abs(tip.length - 4.0) < 1e-3, `length ${tip.length}`);
+    // Raw tip topZ -1.0, botZ -5.0 → a 4.0 Z drop, over a 1.414 XY run from the
+    // socket at (5,5) to the contact at (4,4). The cone's length is the 3D
+    // distance, not the Z delta: hypot(1.414, 4.0) = 4.2426.
+    assert.ok(Math.abs(tip.length - Math.hypot(Math.SQRT2, 4.0)) < 1e-3, `length ${tip.length}`);
   });
 
   it('groups multiple sub-1 tips on one knot as a branched support', () => {
@@ -191,14 +211,27 @@ describe('CbxParser.parseBuffer — chain model', () => {
 /**
  * Real-file regression against the verified SPOTLIGHT reconstruction (7 supports,
  * 8 tips, including branched support IV). Ground truth comes from an independent
- * Cbx layer scrub, NOT the (previously-buggy) Python oracle.
+ * Cbx layer scrub.
  *
- * Auto-skips when the fixture is absent.
+ * The fixture is a 3.8 MB binary and is not committed. Drop SPOTLIGHT.chitubox
+ * beside this file, or point CBX_FIXTURES at a directory holding it:
+ *
+ *   CBX_FIXTURES="/path/to/fixtures" npx tsx --test CbxParser.test.ts
+ *
+ * Auto-skips when the fixture cannot be found.
  */
 describe('CbxParser real-file regression (SPOTLIGHT.chitubox)', () => {
   const fs = require('node:fs') as typeof import('node:fs');
   const path = require('node:path') as typeof import('node:path');
-  const fixture = path.join(__dirname, 'SPOTLIGHT.chitubox');
+  const candidates = [
+    path.join(__dirname, 'SPOTLIGHT.chitubox'),
+    ...(process.env.CBX_FIXTURES ?? '')
+      .split(/[;,]/)
+      .map((d) => d.trim())
+      .filter(Boolean)
+      .map((d) => path.join(d, 'SPOTLIGHT.chitubox')),
+  ];
+  const fixture = candidates.find((p) => fs.existsSync(p)) ?? candidates[0];
   const present = fs.existsSync(fixture);
 
   // Verified ground truth (world frame). Each entry: pillar diameter, base?,

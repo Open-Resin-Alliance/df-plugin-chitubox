@@ -45,21 +45,12 @@ export function cbxDebug(...args: unknown[]): void {
 }
 
 /**
- * Fallback support-tip defaults handed to createContactAssembly when a value
- * isn't authored in the Cbx record. Field set matches what the assembly
- * helper reads (lengthMm, bodyDiameterMm, contactDiameterMm, diskThicknessMm,
- * maxStandoffMm, standoffAngleThreshold, penetrationMm). Values mirror the
- * host's current DEFAULT_TIP_* settings (contact 0.3, body 1.0, length 2.5,
- * penetration 0.1) so the cone body stays native DragonFruit proportions — a
- * narrow body emerges from within the knot sphere (convex join, no "cup").
+ * Fallback tip defaults for createContactAssembly, used only where the Cbx
+ * record authors no value. They mirror the host's DEFAULT_TIP_* settings, so
+ * the cone keeps native proportions.
  *
- * NOTE: contactDiameterMm here is only a FALLBACK. Each tip's authored contact
- * diameter (the connection footprint) always takes precedence and is preserved
- * exactly — only the body/socket end falls back to native when unauthored.
- *
- * If the host's live `settings.tip` is passed into convert(), those values are
- * used instead (see resolveTipDefaults), so the body matches the user's actual
- * DragonFruit tip settings.
+ * An authored contact diameter always wins; only the body end falls back. If
+ * the host's live `settings.tip` reaches convert(), it is used instead.
  */
 export const CBX_TIP_DEFAULTS = {
   lengthMm: 2.5,
@@ -74,11 +65,9 @@ export const CBX_TIP_DEFAULTS = {
 export type CbxTipDefaults = typeof CBX_TIP_DEFAULTS;
 
 /**
- * Fallback root/shaft defaults. Root pad diameter and disk/cone heights follow
- * convertLysData, which sources them from settings.roots rather than from the
- * source file. Cbx's skate radius is intentionally NOT used as the pad
- * diameter, matching LYS behaviour (the plate footprint is a DragonFruit
- * setting, not authored geometry).
+ * Fallback root/shaft defaults, sourced from settings rather than the file.
+ * Cbx's skate radius is deliberately not used as the pad diameter: the plate
+ * footprint is a DragonFruit setting, not authored geometry.
  */
 export const CBX_ROOT_DEFAULTS = {
   diameterMm: 3.0,
@@ -169,10 +158,9 @@ export interface CbxSupport {
    * when the support spans between two parts of the model rather than standing
    * on the plate. Its socket meets the pillar bottom; its contact is below.
    *
-   * With one of these the support is a DragonFruit Stick: a model-to-model
-   * element whose two contact cones are this one and the lowest upward tip,
-   * with the pillar as its body. Any remaining upward tips become leaves or
-   * branches on the hub.
+   * With one of these the support is a DragonFruit Stick.
+   * Any remaining upward tips become leaves or branches on the hub.
+   * 
    */
   downwardTip?: CbxTip;
 }
@@ -212,9 +200,7 @@ export interface CbxBrace {
 }
 
 /**
- * A twig: a tiny model-to-model support (a short strut whose BOTH ends contact the
- * model, using the model itself as the brace). Distinct from a brace (which links
- * two supports) — a twig never touches a support. Cbx stores it as a sub-12 record.
+ * A twig support equiv. Cbx stores it as a sub-12 record.
  */
 export interface CbxTwig {
   /** Contact endpoint A (world space, on the model surface). */

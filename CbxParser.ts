@@ -1,36 +1,29 @@
 import * as THREE from 'three';
 import type { CbxModelInput, CbxSupport, CbxBrace, CbxTwig, CbxJunctionBranch } from './CbxConverter';
+import { buildSupportGraph } from './converter/supportGraph';
+import { emitFromGraph } from './converter/graphEmit';
 
 /**
- * Parser for `.chitubox` project files.
+ * Parser for `.chitubox` project files, scoped to what import needs: model mesh
+ * geometry per distinct model, and the parametric support records DragonFruit
+ * rebuilds into editable primitives.
  *
- * A faithful TypeScript port of the verified Python extractor (chitubox_extract
- * v15), scoped to what DragonFruit import needs:
- *   - model mesh geometry (per distinct model), and
- *   - parametric support records (tip / pillar / base), which DragonFruit
- *     rebuilds into editable support primitives.
+ * Support mesh triangles are deliberately not extracted, since support geometry
+ * is regenerated from the records to stay re-editable. Their extent is still
+ * located, because it bounds each block's geometry region.
  *
- * Support *mesh* triangles are intentionally NOT extracted: DragonFruit
- * regenerates support geometry from the parametric records so it stays
- * re-editable. The multi-model block→geo mapping is still computed (supports
- * must attach to the correct model), which requires locating each block's
- * support-geometry end as a boundary even though those triangles aren't kept.
- *
- * Format summary (see chitubox_format_report.md for the full spec):
+ * Format:
  *   - 4-byte LE magic 0xAB231243 at offset 0.
- *   - field4 (offset 4) = total model instance count (NOT a version).
- *   - Per-instance header blocks of 680 bytes start at mesh_offset + 720.
- *   - Parametric records are 72 bytes, tagged 0xEA342389, grouped 4-per-support,
- *     typed by a sub-index (1/3 tip, 9 pillar, 4/5 base, 2 model-header, 6 summary).
- *   - Model geometry is flat 36-byte float32 triangles (no normals/attributes).
+ *   - field4 (offset 4) = model instance count, not a version.
+ *   - Per-instance header blocks of 680 bytes.
+ *   - Support records are 72 bytes, tagged 0xEA342389, typed by a sub-index.
+ *   - Model geometry is flat 36-byte float32 triangles, no normals.
  */
 
 const MAGIC = 0xab231243;
 const TAG_EA = 0xea342389;
 const REC_SIZE = 72;
 
-// Corrected anatomy sub-index roles (verified against SPOTLIGHT.chitubox layer
-// scrub + chain-continuity analysis — see chitubox-plugin-findings.md).
 // A support is a VERTICAL CHAIN of parts, not a fixed group of 4 records:
 //   [base pad sub-4] → pillar sub-3 → knot sub-9 → one-or-more tips sub-1
 // stitched by the continuity rule (each part's botZ ≈ the part-below's topZ).
@@ -39,16 +32,18 @@ const KNOT_SUB = 9; // spherical joint atop the pillar
 const PILLAR_SUB = 3; // vertical shaft (NOT a tip — this was the core bug)
 const BASE_SUB = 4; // wide base pad cone (only on larger supports)
 const FOOT_SUB = 5; // wide flat ground-contact disk; its bottom marks the plate.
-                    // One sits under each support (sometimes clustered into what
-                    // looks like a "platform"). The disk bottom is always exactly
-                    // at the plate, so it is the authoritative ground anchor.
 const TWIG_SUB = 12; // tiny model-to-model support: a short strut whose BOTH ends
                      // contact the model, using the model itself as the brace.
 const MODEL_HDR_SUB = 2; // skip
-const SUMMARY_SUB = 6; // skip (was previously NOT skipped — bug)
+const SUMMARY_SUB = 6; // skip
 
 const INLINE_PAD = 436;
-const COORD_LIMIT = 500; // reject vertices outside ±500mm (matches Python guard)
+// The gap from an instance's support pointer to its first TAG record. 436 in
+// the common layout, 416 in the field12 == 420 variant. Rather than key off the
+// variant, seek the TAG: the pad is a fixed header whose size is the only thing
+// that moves, and a wrong guess silently drops every support on the instance.
+const INLINE_PAD_MAX = 512;
+const COORD_LIMIT = 500; // reject vertices outside ±500mm
 // A sub-3 record whose two endpoints differ in XY by more than this is a brace
 // (diagonal shaft-to-shaft strut) rather than a vertical pillar. Vertical pillars
 // have identical endpoints (delta ~0); the smallest real braces span >1.5mm, so
@@ -70,6 +65,20 @@ const ABS_PROBE_LIMIT = 65536; // how far into the file the absolute scan looks
 
 const LOG_PREFIX = '[CbxParser]';
 
+/**
+ * Build supports with the endpoint graph (supportGraph + graphEmit) instead of
+ * the top-down chain builder.
+ *
+ * The graph derives structure geometrically -- endpoint coincidence, T-junction
+ * splits, anchor proximity -- rather than walking pillars from the top. 
+ *
+ * Set CBX_CHAIN_BUILDER=1 to fall back to the chain builder. Both paths stay
+ * live so the two can be compared on the same file.
+ */
+const USE_GRAPH_BUILDER = !(
+  typeof process !== 'undefined' && process.env && process.env.CBX_CHAIN_BUILDER === '1'
+);
+
 /** Little-endian readers over a DataView (mirror struct.unpack_from('<I'/'<f')). */
 function u32(view: DataView, off: number): number {
   return view.getUint32(off, true);
@@ -78,8 +87,32 @@ function f32(view: DataView, off: number): number {
   return view.getFloat32(off, true);
 }
 
+/**
+ * Resolve an instance's support pointer to the start of its parametric block.
+ * Returns null when no TAG record sits within INLINE_PAD_MAX bytes.
+ */
+function resolveSupportBlock(view: DataView, len: number, supPtr: number): number | null {
+  // The block header at supPtr carries the record-block address at +4. Verified
+  // against 181/181 support blocks, so the pad is authored, not fixed: it is 436
+  // under a 412-byte file header and 416 under a 420-byte one.
+  if (supPtr + 8 <= len) {
+    const authored = u32(view, supPtr + 4);
+    if (authored > 0 && authored + 4 <= len && u32(view, authored) === TAG_EA) return authored;
+  }
+  // Fall back to the historically observed pads before scanning.
+  for (const pad of [INLINE_PAD, 416]) {
+    const base = supPtr + pad;
+    if (base > 0 && base + 4 <= len && u32(view, base) === TAG_EA) return base;
+  }
+  const limit = Math.min(len - 4, supPtr + INLINE_PAD_MAX);
+  for (let base = Math.max(0, supPtr); base <= limit; base += 4) {
+    if (u32(view, base) === TAG_EA) return base;
+  }
+  return null;
+}
+
 /** One decoded 72-byte parametric record. */
-interface RawRecord {
+export interface RawRecord {
   sub: number;
   x: number;
   y: number;
@@ -111,11 +144,6 @@ function readRecord(view: DataView, base: number): RawRecord {
     geoBytes: u32(view, base + 44),
     extra: f32(view, base + 48),
   };
-}
-
-/** Find the first TAG_EA byte sequence in [from, to). Returns -1 if absent. */
-function findFirstTag(bytes: Uint8Array, from: number, to: number): number {
-  return indexOfU32(bytes, TAG_EA, from, to);
 }
 
 /** Search for a little-endian uint32 value in bytes within [from, to). */
@@ -162,28 +190,42 @@ function splitBlocks(tags: number[]): number[] {
 }
 
 /**
- * Parse all supports from one model's record block using the CHAIN model.
- *
- * A support is a vertical chain: [base pad sub-4] → pillar sub-3 → knot sub-9 →
- * one-or-more tips sub-1. The number of supports equals the number of pillar
- * (sub-3) records. Parts are stitched by:
- *   - knot: shares pillar XY, knot center (topZ+botZ)/2 ≈ pillar topZ
- *   - base: shares pillar XY, base topZ ≈ pillar botZ
- *   - tips: tip botZ ≈ knot center; assigned to the nearest such support, with
- *     XY distance from the pillar as a tiebreak so branched tips (own contact XY)
- *     and closely-stacked supports don't steal each other's tips.
- *
+ * Debug side-channel: when set, `parseBuffer` records the resolved coordinates of
+ * every support block it decodes, so an out-of-tree structure builder can be run
+ * over byte-identical input without duplicating block resolution. Off in normal
+ * use; nothing in the import path reads it.
  */
-function parseSupportBlock(
+export interface CbxBlockRef {
+  modelIndex: number;
+  recBase: number;
+  geoPtr: number;
+  zOff: number;
+}
+export const cbxDebugBlocks: { capture: CbxBlockRef[] | null } = { capture: null };
+
+/**
+ * Decode every parametric record in one support block, in file order.
+ *
+ * Shared by both structure builders, so they cannot drift apart on input.
+ */
+export function decodeSupportBlockRecords(
   view: DataView,
-  bytes: Uint8Array,
   recBase: number,
   geoPtr: number,
   zOff: number,
-  modelIdx: number,
-): { supports: CbxSupport[]; braces: CbxBrace[]; twigs: CbxTwig[]; junctionBranches: CbxJunctionBranch[] } {
-  void bytes; // reserved: support-chain parsing reads via the DataView only.
-  const totalRecBytes = geoPtr - recBase;
+): RawRecord[] {
+  // geoPtr marks the end of the block. One variant stores it relative to the
+  // block rather than absolute, which yields a negative span; when it cannot be
+  // a valid end marker, count the TAG run instead. Records are contiguous, so
+  // walking until the tag stops matching gives the same total.
+  let totalRecBytes = geoPtr - recBase;
+  if (totalRecBytes <= 0 || recBase + totalRecBytes > view.byteLength) {
+    let end = recBase;
+    while (end + REC_SIZE <= view.byteLength && u32(view, end) === TAG_EA) {
+      end += REC_SIZE;
+    }
+    totalRecBytes = end - recBase;
+  }
   const totalRecs = Math.floor(totalRecBytes / REC_SIZE);
 
   // Decode every record in the block (world-frame Z), skipping header + summary.
@@ -207,9 +249,8 @@ function parseSupportBlock(
       // No re-orientation is needed: the fields already follow the tip
       // convention. (x, y, topZ) is the narrow contact end -- here below the
       // socket, because this cone points DOWN onto the model -- and
-      // (x2, y2, botZ) is the wide socket, which lands exactly on the knot the
-      // branch hangs from. The chain builder matches a tip by its botZ, so it
-      // attaches correctly as-is.
+      // (x2, y2, botZ) is the wide socket, landing on the knot the branch
+      // hangs from.
       rec.sub = TIP_SUB;
     }
     // Shift Z into world frame up front so all continuity math is in one frame.
@@ -217,12 +258,64 @@ function parseSupportBlock(
     rec.botZ += zOff;
     recs.push(rec);
   }
+  return recs;
+}
+
+/**
+ * Graph-builder entry point, shaped like parseSupportBlock so the two are
+ * interchangeable at the call site. Anything the emitter cannot place is warned
+ * about rather than silently dropped.
+ */
+function buildViaGraph(
+  view: DataView,
+  recBase: number,
+  geoPtr: number,
+  zOff: number,
+  modelIdx: number,
+): { supports: CbxSupport[]; braces: CbxBrace[]; twigs: CbxTwig[]; junctionBranches: CbxJunctionBranch[] } {
+  const recs = decodeSupportBlockRecords(view, recBase, geoPtr, zOff);
+  const graph = buildSupportGraph(recs.map((r, i) => ({ index: i, ...r })));
+  const emitted = emitFromGraph(graph, recs);
+
+  console.log(
+    `${LOG_PREFIX} instance ${modelIdx} (graph): ${emitted.supports.length} supports, `
+    + `${emitted.braces.length} braces, ${emitted.twigs.length} twigs, `
+    + `${emitted.junctionBranches.length} junction branch(es).`,
+  );
+  if (emitted.skipped.length > 0) {
+    const byReason = new Map<string, number>();
+    for (const s of emitted.skipped) {
+      byReason.set(s.reason, (byReason.get(s.reason) ?? 0) + 1);
+    }
+    console.warn(
+      `${LOG_PREFIX} instance ${modelIdx} (graph): ${emitted.skipped.length} part(s) unplaced -- `
+      + [...byReason.entries()].map(([r, n]) => `${n} ${r}`).join(', '),
+    );
+  }
+
+  return {
+    supports: emitted.supports,
+    braces: emitted.braces,
+    twigs: emitted.twigs,
+    junctionBranches: emitted.junctionBranches,
+  };
+}
+
+function parseSupportBlock(
+  view: DataView,
+  bytes: Uint8Array,
+  recBase: number,
+  geoPtr: number,
+  zOff: number,
+  modelIdx: number,
+): { supports: CbxSupport[]; braces: CbxBrace[]; twigs: CbxTwig[]; junctionBranches: CbxJunctionBranch[] } {
+  void bytes; // reserved: support-chain parsing reads via the DataView only.
+  const recs = decodeSupportBlockRecords(view, recBase, geoPtr, zOff);
 
   // A sub-3 record is a BRACE (diagonal strut between two shafts) when its two
   // endpoints differ in XY; otherwise it is a normal vertical pillar. Splitting
-  // here keeps the vertical-chain logic below unchanged and routes braces to
-  // their own output (previously these diagonal struts were silently dropped as
-  // "tipless pillars").
+  // here keeps the vertical-chain logic below unchanged and routes diagonal
+  // struts to their own output.
   const isBrace = (r: RawRecord): boolean =>
     r.sub === PILLAR_SUB && Math.hypot(r.x - r.x2, r.y - r.y2) > BRACE_XY_MIN;
 
@@ -334,14 +427,12 @@ function parseSupportBlock(
   // Assign each tip to the chain whose knot center matches its botZ; tiebreak by
   // XY distance from the pillar (handles branched tips + stacked supports).
   //
-  // The Z gate alone is NOT sufficient. On a large model many pillars share a knot
-  // height, so a tip could bind to a chain anywhere on the plate purely because the
-  // Z lined up -- Supported_Chest_Back had 5 tips matched to chains 52-59mm away in
-  // XY, which then rendered as giant leaves spanning the whole model.
+  // The Z gate alone is NOT sufficient: on a large model many pillars share a
+  // knot height, so a tip can bind to a chain anywhere on the plate purely
+  // because the Z lined up, rendering as a giant leaf across the model.
   //
-  // A tip's SOCKET sits on its own pillar: measured across that file the socket is
-  // 0.00mm from the nearest pillar at the median and 2.45mm at worst. Cap the match
-  // well above that (8mm) so genuine branched/offset tips still bind while a
+  // A tip's SOCKET sits on its own pillar, so cap the match on XY distance --
+  // far enough out that genuine branched or offset tips still bind while a
   // cross-model match cannot. Score on the SOCKET, not the contact: the contact end
   // legitimately reaches out to the model, the socket is the end that must sit on
   // the shaft.
@@ -492,8 +583,7 @@ function parseSupportBlock(
   // (or the platform they form) — instead we ground each support to its own foot
   // bottom: lower the base pad to the foot bottom (the plate) and extend the
   // pillar down to meet it, leaving the knot/tips/pillar-top untouched so model
-  // contact is unchanged. This is the principled form of the old height heuristic:
-  // sub-5 is the authoritative ground anchor, so a support raised onto a platform
+  // contact is unchanged. sub-5 is the authoritative ground anchor, so a support raised onto a platform
   // is grounded by however much its foot is tall — no magic threshold, and bare
   // mid-air pillars (no foot beneath them) are correctly left alone.
   const FOOT_MATCH_TOL_MM = 1.0; // a support owns the foot within this XY radius
@@ -555,9 +645,8 @@ function parseSupportBlock(
     if (footBottomFor(c.pillar.x, c.pillar.y) !== null) return false; // sits on a foot
     // Airborne with no pad and no foot: a branch, not a trunk. Converging braces
     // are the usual reason (a fork junction), but a pillar can also stand
-    // directly on the model surface with nothing feeding it -- CriosphinxHead
-    // has one starting 21mm up. Either way a grounded trunk would plant a root
-    // cup in mid-air, which the support model never allows.
+    // directly on the model surface with nothing feeding it. Either way a
+    // grounded trunk would plant a root cup in mid-air.
     return true;
   };
 
@@ -663,8 +752,7 @@ function parseSupportBlock(
       isForkJunction: fork,
       // A contact hanging DOWN from the pillar bottom means this support spans
       // between two parts of the model rather than standing on the plate. Its
-      // socket sits on the bottom knot; the chain builder only matches tips to
-      // the TOP knot, so it is picked up here.
+      // Its socket sits on the bottom knot rather than the top.
       downwardTip: (() => {
         // Exactly one downward tip per stick-shaped support across every test
         // file (verified by trace); find() is sufficient.
@@ -719,7 +807,12 @@ function parseSupportBlock(
  * or null if no plausible table is found. Used for files without a usable
  * meshOffset, where this is the only way to find where geometry begins.
  */
-function earliestGeometryStart(view: DataView, len: number, nInstances: number): number | null {
+function earliestGeometryStart(
+  view: DataView,
+  len: number,
+  nInstances: number,
+  tablePtr = 0,
+): number | null {
   const TAIL_OFF = 256;
   const STRIDE_OFF = 680;
 
@@ -734,7 +827,13 @@ function earliestGeometryStart(view: DataView, len: number, nInstances: number):
     );
   };
 
-  for (let base = 0; base < Math.min(ABS_PROBE_LIMIT, len); base += 4) {
+  // The scan below only reaches ABS_PROBE_LIMIT; a table beyond that is found
+  // only via the header pointer.
+  const candidates: number[] = [];
+  if (tablePtr > 0 && tablePtr < len) candidates.push(tablePtr);
+  for (let base = 0; base < Math.min(ABS_PROBE_LIMIT, len); base += 4) candidates.push(base);
+
+  for (const base of candidates) {
     if (!recValid(base)) continue;
     if (nInstances >= 2 && !recValid(base + STRIDE_OFF)) continue;
     let earliest = len;
@@ -755,7 +854,7 @@ function earliestGeometryStart(view: DataView, len: number, nInstances: number):
 /**
  * Read a flat 36-byte-triangle geometry region into a non-indexed position
  * array (THREE expects 3 verts × 3 floats per triangle). Applies the Z offset
- * and drops any triangle with a vertex outside ±COORD_LIMIT (matches Python).
+ * and drops any triangle with a vertex outside ±COORD_LIMIT.
  */
 function readGeometryToPositions(
   view: DataView,
@@ -828,7 +927,23 @@ export class CbxParser {
 
     const nInstances = u32(view, 4); // field4 = total instance count
     const fnamePtr = u32(view, 8);
-    const meshOffset = u32(view, 424);
+    // field8 doubles as the record-table pointer: it addresses the first
+    // record, whose leading member is that same filename string.
+    const tablePtr = fnamePtr;
+
+    // field12 is a base offset: a small pointer block follows it, carrying the
+    // record-table delta at +8 and the mesh-section offset at +12. The record
+    // table is then meshOffset + delta, which reproduces field8 exactly.
+    //
+    // Reading these at a hardcoded 420/424 assumes base == 412, which holds for
+    // the common writer but not for a later one that moved the block to 420, nor
+    // for a file with no mesh section at all (base 0, mesh 0, delta 412 -- the
+    // table sits immediately after the fixed header). The rule below needs no
+    // special case for any of them: verified against 161/161 files.
+    const ptrBlock = u32(view, 12);
+    const ptrBlockUsable = ptrBlock + 16 <= len;
+    const meshOffset = ptrBlockUsable ? u32(view, ptrBlock + 12) : u32(view, 424);
+    const tableDelta = ptrBlockUsable ? u32(view, ptrBlock + 8) : 444;
 
     const filename = decodeCString(bytes, fnamePtr, 64) || sourceName;
 
@@ -845,38 +960,14 @@ export class CbxParser {
       );
     }
 
-    // Primary model tri count lives at mesh_offset + 720. It marks where
-    // geometry begins, bounding the support-record and Z-offset scans below.
-    const modelBytes0 = meshOffsetUsable ? u32(view, meshOffset + 720) : 0;
-    let modelStart = modelBytes0 > 0
-      ? len - Math.floor(modelBytes0 / 36) * 36
-      : len;
+    // Primary model tri count, used only by the degenerate fallback header
+    // below. A meshOffset that passes the range check can still be a non-header
+    // field, reading as a nonsense count, so implausible values are discarded.
+    const rawModelBytes0 = meshOffsetUsable ? u32(view, meshOffset + 720) : 0;
+    const modelBytes0 = rawModelBytes0 > 0 && rawModelBytes0 <= len && rawModelBytes0 % 36 === 0
+      ? rawModelBytes0
+      : 0;
 
-    // Without meshOffset that shortcut is unavailable and modelStart is left at
-    // EOF, which would let the scans run over the geometry and read a mesh
-    // vertex as the plate Z. Derive the boundary from the record table instead.
-    if (!meshOffsetUsable) {
-      const earliest = earliestGeometryStart(view, len, nInstances);
-      if (earliest !== null && earliest < modelStart) {
-        modelStart = earliest;
-      }
-    }
-
-    // Locate first TAG; absence means a no-support file.
-    const tagScanStart = meshOffsetUsable ? meshOffset + 720 : 0;
-    const firstTag = findFirstTag(bytes, tagScanStart, modelStart);
-    const hasSupports = firstTag !== -1;
-
-    // Z offset: most-negative plausible float in the post-header scan region.
-    const scanStart = hasSupports ? firstTag : modelStart;
-    let minZ = 0.0;
-    for (let i = scanStart; i < len - 3; i += 4) {
-      const fv = f32(view, i);
-      if (!Number.isNaN(fv) && fv > -500.0 && fv < 0.0 && fv < minZ) {
-        minZ = fv;
-      }
-    }
-    const zOff = -minZ;
 
     // ---- Per-instance record table (authored ground truth) ----------------
     //
@@ -900,16 +991,7 @@ export class CbxParser {
     //   filename @ meshOffset + 444 + k*680
     //   tail     @ meshOffset + 700 + k*680   (= filename + 256)
     //
-    // Verified field-by-field against guns.chitubox (11 records) and
-    // SPOTLIGHT.chitubox (1 record): support pointers land exactly on each model's
-    // own parametric block (tip counts match the authoring app), and geometry
-    // spans match the exported OBJ/STL bounding boxes triangle-for-triangle.
-    //
-    // NOTE: an earlier revision read these fields 20 bytes too high (relative to
-    // meshOffset+720). That single shift produced every prior symptom — wrong
-    // plate placement, support mis-ownership, a phantom "embedded block", and
-    // corrupted OBJ geometry. The offsets above are correct; no special-casing of
-    // anomalous entries, embedded blocks, or duplicate inference is needed.
+
 
     const TAIL = 256; // tail offset within a record
     const STRIDE = 680;
@@ -945,10 +1027,24 @@ export class CbxParser {
     };
 
     const findRecordBase = (): number => {
-      const expected = meshOffset + 444;
+      const expected = meshOffset + tableDelta;
       // Checked first, so a valid file can never match elsewhere by chance.
       if (meshOffset > 0 && meshOffset < len && baseLooksValid(expected)) {
         return expected;
+      }
+      // Header field 8 points straight at the first record in every file that
+      // has a table. Most writers keep it in sync with meshOffset+444, but one
+      // variant (field12 == 420, carrying explicit table bounds in fields 16/20)
+      // puts the table megabytes away from meshOffset, out of reach of both the
+      // nearby-shift and absolute scans below.
+      if (tablePtr > 0 && tablePtr < len && baseLooksValid(tablePtr)) {
+        if (tablePtr !== expected) {
+          console.warn(
+            `${LOG_PREFIX} record table taken from header field 8 (${tablePtr}); `
+            + `meshOffset+${tableDelta} would have given ${expected}.`,
+          );
+        }
+        return tablePtr;
       }
       // Nearby shifts, smallest displacement first.
       if (meshOffset > 0 && meshOffset < len) {
@@ -978,12 +1074,59 @@ export class CbxParser {
       // report the failure as they always have.
       console.warn(
         `${LOG_PREFIX} could not locate a valid record table (meshOffset=${meshOffset}); `
-        + `falling back to meshOffset+444.`,
+        + `falling back to meshOffset+${tableDelta}.`,
       );
       return expected;
     };
 
     const REC_BASE = findRecordBase(); // first record (filename) start
+
+    // Z offset: the raft sits at the most-negative authored Z, and the scene is
+    // lifted by that much so the plate lands at zero.
+    //
+    // Read topZ/botZ out of the parametric records rather than sweeping raw
+    // floats: a sweep cannot tell a plate coordinate from a Z, and support
+    // blocks do not reliably precede geometry.
+    let minZ = 0.0;
+    let sawSupportRecord = false;
+    for (let k = 0; k < nInstances; k++) {
+      const tail = REC_BASE + k * STRIDE + TAIL;
+      if (tail + 28 > len) break;
+      const supPtr = u32(view, tail + 12);
+      if (supPtr === NO_SUPPORT || supPtr === 0) continue;
+      const blockBase = resolveSupportBlock(view, len, supPtr);
+      if (blockBase === null) continue;
+      let rb = blockBase;
+      for (; rb + REC_SIZE <= len && u32(view, rb) === TAG_EA; rb += REC_SIZE) {
+        const sub = u32(view, rb + 4);
+        if (sub === SUMMARY_SUB) continue; // sentinel Z values, not geometry
+        sawSupportRecord = true;
+        const topZ = f32(view, rb + 16);
+        const botZ = f32(view, rb + 28);
+        for (const z of [topZ, botZ]) {
+          if (!Number.isNaN(z) && z > -500.0 && z < minZ) minZ = z;
+        }
+      }
+
+      // The records describe pillars and pads, but the raft they stand on is
+      // only present as baked triangles, so the lowest authored record sits one
+      // pad-thickness above the plate. Chitubox writes that mesh between the
+      // records and the geometry (or after the geometry in the later layout);
+      // scan whichever side is present for the true floor.
+      const geoStart = u32(view, tail + 16);
+      const geoEnd = geoStart + u32(view, tail + 20);
+      const bakedStart = rb;
+      const bakedEnd = geoStart > bakedStart ? geoStart : geoEnd;
+      if (bakedEnd > bakedStart && bakedEnd <= len) {
+        for (let i = bakedStart + 8; i + 4 <= bakedEnd; i += 12) {
+          const z = f32(view, i);
+          if (!Number.isNaN(z) && z > -500.0 && z < minZ) minZ = z;
+        }
+      }
+    }
+    const hasSupports = sawSupportRecord;
+    const zOff = -minZ;
+
 
 
     interface InstanceHeader {
@@ -1071,18 +1214,21 @@ export class CbxParser {
       let twigs: CbxTwig[] = [];
       let junctionBranches: CbxJunctionBranch[] = [];
       if (h.supPtr !== NO_SUPPORT && h.supPtr !== 0) {
-        const recBase = h.supPtr + INLINE_PAD;
-        if (recBase > 0 && recBase < len && u32(view, recBase) === TAG_EA) {
+        const recBase = resolveSupportBlock(view, len, h.supPtr);
+        if (recBase !== null) {
           const geoPtr = u32(view, recBase + 40); // block-end marker the chain parser uses
-          const parsed = parseSupportBlock(view, bytes, recBase, geoPtr, zOff, h.index);
+          cbxDebugBlocks.capture?.push({ modelIndex: h.index, recBase, geoPtr, zOff });
+          const parsed = USE_GRAPH_BUILDER
+            ? buildViaGraph(view, recBase, geoPtr, zOff, h.index)
+            : parseSupportBlock(view, bytes, recBase, geoPtr, zOff, h.index);
           supports = parsed.supports;
           braces = parsed.braces;
           twigs = parsed.twigs;
           junctionBranches = parsed.junctionBranches;
         } else {
           console.warn(
-            `${LOG_PREFIX} instance ${h.index}: support pointer ${h.supPtr} (+${INLINE_PAD} `
-            + `= ${recBase}) does not land on a TAG record; skipping supports.`,
+            `${LOG_PREFIX} instance ${h.index}: no TAG record within `
+            + `${INLINE_PAD_MAX} bytes of support pointer ${h.supPtr}; skipping supports.`,
           );
         }
       }

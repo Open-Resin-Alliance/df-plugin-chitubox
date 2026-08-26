@@ -23,43 +23,14 @@ import { createContactAssembly } from './converter/contactAssembly';
 import { v4 as uuidv4 } from 'uuid';
 
 /**
- * Converts parsed Cbx supports (CHAIN model) into DragonFruit's import
- * format. Each parsed support is a vertical chain — [base pad] → pillar → knot →
- * one-or-more tips — which maps onto DragonFruit anatomy as:
+ * Converts parsed Cbx supports into DragonFruit's import format. A support is a
+ * chain -- [base pad] -> pillar -> knot -> tips -- becoming Roots -> Trunk with
+ * a cone for the tallest tip, and a Knot + Branch for each extra one.
  *
- *     Roots (from base pad if present, else settings-sized; on the plate)
- *       → Trunk
- *           → segment 0: root → knot joint   (bottomJoint undefined = "on Root")
- *           → segment 1: knot joint → primary tip's socket joint
- *           → contactCone (primary/tallest tip, built by createContactAssembly)
- *     + per EXTRA tip: a Knot on the shaft + a Branch with its own contactCone
- *
- * Cone + socket construction is delegated to createContactAssembly — the SAME
- * helper convertLysData uses — so cone profile, socket placement, and disk
- * offset match the rest of the app. It is fed a synthesized `tipSettings`
- * carrying the AUTHORED tip diameters and length, routed through its geometric
- * path (Cbx stores no per-support contact normal; the model mesh, if
- * supplied, lets the helper raycast the true surface normal).
- *
- * Authored anatomy used (all verified against real data, see
- * chitubox-plugin-findings.md):
- *   pillar (sub-3): authored shaft diameter (paramA×2), top = knot center.
- *   knot   (sub-9): Joint at authored center Z, authored sphere diameter.
- *   tip    (sub-1): contactDiameter (small, on the model) = paramA×2;
- *                   bodyDiameter (larger socket) = paramB×2;
- *                   authored cone length = contactZ − attachZ (passed as
- *                   tipSettings.length — critical: prevents a default-length
- *                   cone from pushing the socket below the plate on short supports).
- *   base   (sub-4): Roots cone, bottom radius on the plate.
- *
- * Placement: the parser returns world-frame Z. This converter RAFT-NORMALIZES —
- * it subtracts the raft top (min pillar/base bottom across the model) so support
- * bases land on DragonFruit's plate at z = 0 and DF applies its own raft. modelId
- * is a placeholder; the host reassigns it via reassignModelId() after conversion.
+ * Z is raft-normalised so bases land on the plate at 0; modelId is a
+ * placeholder the host reassigns.
  */
-
-// Shared CBX types, constants, and the debug helper now live in converter/types.
-// Re-exported here so existing importers of CbxConverter keep working unchanged.
+// Re-exported so existing importers of CbxConverter keep working.
 import {
   LOG_PREFIX,
   CBX_DEBUG,
@@ -89,16 +60,10 @@ export type {
 } from './converter/types';
 
 /**
- * The raft-top height (world frame) for a set of supports: the minimum base/
- * pillar bottom Z. Subtracting it raft-normalizes the scene so support bases
- * land on DragonFruit's plate at z = 0.
- *
- * Exported so the file-type bridge can apply the SAME offset to the model mesh's
- * transform — keeping geometry and supports in the same frame. Returns 0 when
- * there are no supports (nothing to anchor against).
+ * Raft-top height: the minimum base/pillar bottom Z. Exported so the bridge can
+ * apply the same offset to the model mesh and keep both in one frame.
  */
-// computeRaftZ / computeModelLift live in converter/clusterTransform; re-exported
-// here so existing importers of CbxConverter keep working.
+// Re-exported so existing importers of CbxConverter keep working.
 export { computeRaftZ, computeModelLift } from './converter/clusterTransform';
 
 /** Normalize a Vec3; returns a unit-Z fallback for a zero-length input. */
@@ -118,7 +83,7 @@ import {
   applyXYShift as clusterApplyXYShift,
   seatRootsOnPlate as clusterSeatRootsOnPlate,
 } from './converter/clusterTransform';
-import { classifySupportTips, centerCoincidentKnots, collapseDegenerateJoints } from './converter/sanityPasses';
+import { classifySupportTips, centerCoincidentKnots, collapseDegenerateJoints, dedupeCoincidentJoints } from './converter/sanityPasses';
 
 /** Output of converting one support: the entities it contributes. */
 interface BuiltSupport {
@@ -132,23 +97,9 @@ interface BuiltSupport {
 }
 
 /**
- * Convert one parsed chain support into DragonFruit entities using AUTHORED
- * anatomy. `raftZ` is subtracted from all Z values so the support base lands on
- * DragonFruit's plate (z = 0) and DF applies its own raft.
- *
- *   base pad (sub-4)  → Roots (authored radii/heights when present)
- *   pillar (sub-3)    → Trunk shaft segment, authored diameter
- *   knot (sub-9)      → Joint at authored center Z, authored diameter
- *   primary tip       → trunk terminal cone (authored length)
- *   extra tips        → Knot on the shaft + Branch with its own cone
- */
-/**
- * Build a Stick: a model-to-model support whose body spans between two contact
- * points on the model, rather than rising from the plate.
- *
- * The two cones are the authored downward tip and the LOWEST upward tip -- the
- * pair that actually bracket the pillar. Any further upward tips are extra
- * contacts on the hub and are returned as leaves/branches so nothing is lost.
+ * Build a Stick: a support spanning two model contacts rather than rising from
+ * the plate. Its cones are the downward tip and the lowest upward tip; further
+ * upward tips return as leaves or branches on the hub.
  */
 const JOINT_TAPER = 1.1; // twig joint = 1.1x its disk contact diameter
 const JOINT_CLEARANCE_MM = 0.05;
@@ -166,30 +117,11 @@ function buildStick(
   const z = (worldZ: number) => worldZ - raftZ;
   const shaftDiameter = s.pillarDiameter;
 
-  // Built to the SAME contract as the LYS importer's stick path
-  // (convertLysData Phase 4B), which is the working reference for this shape:
-  //
-  //   coneA = createContactAssembly(s, contactA, /* hint */ contactB, ...)
-  //   coneB = createContactAssembly(s, contactB, /* hint */ contactA, ...)
-  //   segment = { bottomJoint: socketJointA, topJoint: socketJointB }
-  //
-  // Two things I had wrong before:
-  //
-  //  1. ORIENTATION. The host puts cone A at the BOTTOM -- stickBuilder writes
-  //     `bottomJoint: socketJointA, topJoint: socketJointB`, and StickRenderer
-  //     falls back to contactConeA for the segment START and contactConeB for
-  //     the END. I had the authored model contact as cone B at the bottom and a
-  //     synthetic cap as cone A at the top, i.e. the stick inverted.
-  //
-  //  2. THE THIRD ARGUMENT. It is the OPPOSITE CONTACT, used as a direction
-  //     hint -- not a socket/hub position to anchor to. Passing hub joints made
-  //     each cone solve against a point that was not the other end of the stick.
-  //
-  // The shaft is defined by the two CONTACTS; the sockets (and therefore the
-  // joints) fall out of that solve. Since this support authors only one model
-  // contact, the top end is the hub the fan hangs from: a zero-length cone whose
-  // socket lands exactly on it, so it satisfies the two-cone type without
-  // drawing a second contact disk.
+  // The shaft is defined by the two contacts; sockets and joints fall out of
+  // the solve. createContactAssembly's third argument is the opposite contact,
+  // a direction hint rather than an anchor. With only one authored contact the
+  // far end is a zero-length cone at the hub.
+
   const CAP_LEN_MM = 1e-4;
   const extraTips = s.tips;
 
@@ -248,8 +180,7 @@ function buildStick(
         id: uuidv4(),
         type: 'straight',
         diameter: shaftDiameter,
-        // A is the bottom cone, B the top -- same order as the host's
-        // stickBuilder and the LYS importer.
+        // A is the bottom cone, B the top, matching the host's stickBuilder.
         bottomJoint: jointA,
         topJoint: jointB,
       },
@@ -265,42 +196,22 @@ function buildStick(
   const branches: Branch[] = [];
   const leaves: Leaf[] = [];
 
-  // ONE KNOT PER LEAF, matching how the host places them by hand: a new knot is
-  // generated at the attach point as each leaf tip is placed. The LYS importer
-  // does the same (convertLysData: a fresh Knot per leaf, never a shared hub).
-  // A single shared knot renders only one leaf attached and leaves the rest
-  // visually detached.
-  //
-  // `t` is the normalised position along the host segment. The host's
-  // normalization derives a knot's position from parentShaftId + t, so omitting
-  // it leaves the knot unanchored on the shaft.
+  // One knot per leaf: a shared knot renders only one leaf attached. `t` is the
+  // normalised position along the host segment, and is required -- the host
+  // derives the knot's position from parentShaftId + t.
   const stickSegment = stick.segments[0];
   // Both joints are set when the stick is built above; fall back to the hub
   // endpoints so the type's optionality does not need an assertion.
   const segStart = stickSegment.bottomJoint?.pos ?? hubBottom;
   const segEnd = stickSegment.topJoint?.pos ?? hubTop;
 
-  // Build the hub knot EXACTLY as the native "sprout leaf" flow does when the
-  // user clicks near a joint (LeafPlacementController, stage awaitingSproutTip):
-  //
-  //     { parentShaftId: seg.id, t: 1.0, pos: joint.pos, diameter: joint.diameter }
-  //
-  // Three details matter, and I had all three slightly off:
-  //   - pos is the JOINT'S OWN position, not a point re-projected onto the
-  //     segment line. The joint is already on the line; re-deriving it introduced
-  //     a sub-millimetre disagreement between pos and t.
-  //   - diameter comes from the JOINT, not from a recomputed shaft diameter, so
-  //     the knot matches the shaft it sits on.
-  //   - no _importHint. The native flow stamps none, and normalization then
-  //     treats the knot as already-consistent instead of relocating it.
+  // Hub knot, matching the native sprout-leaf flow: pos and diameter come from
+  // the JOINT itself, not re-derived, and no _importHint is stamped.
   const hubJoint = stickSegment.topJoint;
   const hubAttachT = 1.0;
-  // COPY the joint's position -- never alias it. The cluster transforms
-  // (applyZShift/applyXYShift) dedupe JOINTS by id but iterate knots
-  // unconditionally, so a knot sharing the joint's Vec3 object gets shifted once
-  // as the joint and again for every knot pointing at it. With six hub knots the
-  // shaft top was translated 7x while the bottom moved once -- the body sheared
-  // away from its own fan. Each knot needs its own Vec3.
+  // COPY the joint's position, never alias it: the cluster transforms dedupe
+  // joints by id but iterate knots unconditionally, so a shared Vec3 gets
+  // shifted once per knot pointing at it.
   const hubAttachSrc: Vec3 = hubJoint?.pos ?? segEnd;
   const hubAttach: Vec3 = { x: hubAttachSrc.x, y: hubAttachSrc.y, z: hubAttachSrc.z };
   for (const tip of extraTips) {
@@ -312,15 +223,9 @@ function buildStick(
       // Fresh Vec3 per knot: see hubAttach above.
       pos: { x: hubAttach.x, y: hubAttach.y, z: hubAttach.z },
       diameter: hubJoint?.diameter ?? getJointDiameter(shaftDiameter),
-      // Stamp 'project' so normalization takes the import-hint fast path
-      // (state.ts) instead of falling through to the heuristic preserve rules
-      // below it. Those heuristics -- preserveAuthoredTerminalLeafHostPos and
-      // friends -- are written for trunk/branch knots and key off
-      // isEndpointProjection, which is TRUE for every hub knot here because they
-      // all sit at t=1.0. Without a hint they decide a stick hub knot's fate by
-      // rules that were never meant for it. The native sprout flow omits the
-      // hint safely because it runs at interaction time, never through
-      // normalizeLoadedKnotAndLeafGeometry; an IMPORTED knot must be explicit.
+      // Stamp 'project' so normalization takes the import-hint fast path. The
+      // heuristics below it key off isEndpointProjection, true for every hub
+      // knot at t=1.0, and were written for trunk/branch knots.
       _importHint: 'project',
     };
     knots.push(leafKnot);
@@ -363,12 +268,9 @@ function buildSupport(
   const rootId = uuidv4();
   let root: Roots;
   if (s.isForkJunction) {
-    // Fork junction: the pillar's base is mid-air at a brace convergence, held up
-    // by the converging struts rather than the plate. It is NOT grounded, so it
-    // must not render a base "cup". Emit a zero-size root at the convergence: the
-    // shaft starts exactly there (the host begins the trunk at root.z + diskHeight
-    // + coneHeight = the convergence) and the braces attaching to this shaft keep
-    // the junction visually connected — but no disk/cone geometry is drawn.
+    // Fork junction: the base is mid-air at a brace convergence, so it must not
+    // render a base cup. A zero-size root starts the shaft exactly there, with no
+    // disk or cone geometry drawn.
     root = {
       id: rootId,
       modelId,
@@ -408,12 +310,9 @@ function buildSupport(
       : getJointDiameter(shaftDiameter),
   };
 
-  // Tips are pre-sorted tallest-first by the parser; primary = first.
-  // A support may have NO model tips: it is a grounded pillar that exists only to
-  // host braces / pillar-to-pillar links (which never touch the model). Emit it as
-  // a contactless trunk — shaft from root up to the knot, no contact cone — so the
-  // braces have a real shaft to attach to. Without this the pillar would be dropped
-  // and its braces orphaned.
+  // Tips are pre-sorted tallest-first; primary = first. A support with no model
+  // tips is a grounded pillar hosting only braces: emit it as a contactless
+  // trunk so those braces have a shaft to attach to.
   const hasModelTip = s.tips.length > 0;
 
   if (!hasModelTip) {
@@ -449,11 +348,9 @@ function buildSupport(
   const leaves: Leaf[] = [];
 
   // --- Trunk for the PRIMARY tip (same for single- and multi-tip supports). ---
-  // LYS-style trunk: root → joint0 (knee) → socket → contact cone. For multi-tip
-  // supports the extra tips become native Branches off a knot on this trunk's shaft
-  // (built below), each growing up to its own contact — the arrangement DF produces
-  // when you place additional supports off a trunk. The trunk is always a normal,
-  // cone-terminated trunk so the engine recognises it as a properly-formed support.
+  // root -> joint0 (knee) -> socket -> contact cone. Extra tips become Branches
+  // off a knot on this shaft. The trunk is always cone-terminated so the engine
+  // recognises it as a properly-formed support.
   const provisionalKneeZ = Math.max(rootTopZ + 0.05, knotCenter);
   const provisionalKnee: Vec3 = { x: px, y: py, z: provisionalKneeZ };
   const primary = createContactAssembly(
@@ -501,19 +398,15 @@ function buildSupport(
   };
 
   // --- Extra tips → native Leaves or Branches off a knot on the trunk shaft. ---
-  // Use the LYS leaf-vs-branch decision per tip: shaftLength = dist(knot→contact) −
-  // tipLen. If ≤ 0.2mm there's no room for a shaft → Leaf (cone straight from the
-  // knot). Otherwise → Branch (single segment knot → socket + short native cone).
-  // All extra tips share one knot on the shaft (Chitu roots them at the pillar top).
+  // shaftLength = dist(knot -> contact) - tipLen. Too short for a shaft gives a
+  // Leaf, otherwise a Branch. All extra tips share one knot, as Chitubox roots
+  // them at the pillar top.
   const fanLeafIds = new Set<string>();
   if (extraTips.length > 0) {
     const topSegment = segments[segments.length - 1];
-    // Place the shared knot at the AUTHORED knot height (knotCenter) — the LYS
-    // "authored attach point" — not the primary cone's socket. Chitubox roots all
-    // tips of a multi-tip support at this shared height; using it lowers the knot to
-    // where the supports actually fan out, so leaves/branches approach their contacts
-    // from below (vertical) instead of meeting the shaft side-on at a right angle.
-    // Clamp to stay on the trunk's top segment (between its bottom joint and socket).
+    // Use the authored knot height, not the primary cone's socket: it is where
+    // the tips actually fan out, so they approach their contacts from below
+    // rather than meeting the shaft side-on. Clamped to the top segment.
     const segBotZ = topSegment.bottomJoint?.pos.z ?? rootTopZ;
     const segTopZ = topSegment.topJoint?.pos.z ?? primary.socketJoint.pos.z;
     const knotZ = Math.max(segBotZ + 0.05, Math.min(knotCenter, segTopZ - 0.05));
@@ -527,12 +420,9 @@ function buildSupport(
     };
     knots.push(sharedKnot);
 
-    // forceLeaf: these extra tips are an authored FAN. Chitubox roots them all at
-    // one shared height and draws each as a single long cone to the model (see the
-    // reference screenshots). Under the length test they are 4-8mm from the knot,
-    // so every one became a Branch -- its own thin shaft plus a short cone -- which
-    // renders as splayed struts radiating outward instead of a clean fan, and
-    // invents shafts the file never authored. Same treatment as a stick's hub fan.
+    // forceLeaf: these tips are an authored fan, rooted at one shared height and
+    // drawn as single long cones. The length test would make each a Branch,
+    // inventing shafts the file never authored.
     for (const tip of extraTips) {
       const { leaf, branch } = buildTipFromKnot(
         tip,
@@ -550,13 +440,9 @@ function buildSupport(
     }
   }
 
-  // Apply the native trunk diameter profile to EVERY trunk (single- and multi-tip).
-  // For multi-tip it splits the shaft at branch knots and thickens bottom-up. For
-  // single-tip it still does the essential job of sizing the top socket joint to the
-  // SHAFT diameter (not the narrow cone body) — without it the shaft (0.80) necks
-  // down to a cone-body joint (0.60) then the cone (0.50), giving the abrupt
-  // "capped"/collared look. This mirrors the host applying the profile on edit (the
-  // recompute the mousewheel triggers), so the imported trunk renders correctly.
+  // Apply the trunk diameter profile to every trunk. Multi-tip splits the shaft
+  // at branch knots and thickens bottom-up; single-tip still needs it to size
+  // the top socket joint to the shaft rather than the narrower cone body.
   applyTrunkDiameterProfile(trunk, rootTopZ, knots, branches);
 
   return { root, trunk, knots, branches, leaves, fanLeafIds: [...fanLeafIds] };
@@ -598,8 +484,7 @@ function resolveShaftDefaults(settings?: SupportSettings): typeof CBX_SHAFT_DEFA
 export class CbxConverter {
   /**
    * Converts one parsed Cbx model (geometry + supports) into DragonFruit's
-   * import format. Mirrors LysConverter.convert's role and output type so the
-   * file-type bridge can treat both identically.
+   * import format.
    *
    * @param model    Parsed model bundle (supports already in world space).
    * @param settings Active support settings; supplies tip/root/shaft defaults
@@ -638,26 +523,14 @@ export class CbxConverter {
     const stickHubLeafIds = new Set<string>();
     const braces: Brace[] = [];
 
-    // Supports are emitted in the SAME world frame as the model geometry (raw +
-    // zOffset), i.e. raftZ = 0 here. This is deliberate: the file-type bridge
-    // then shifts BOTH the supports (via applyZShift) and the model into the
-    // host's render frame using a single offset (the geometry bbox center), so
-    // they stay locked together. Raft-normalizing supports independently here
-    // would put them in a different frame from the (non-normalized) geometry and
-    // desync them by the raft thickness. The buildSupport raftZ parameter is kept
-    // for flexibility but passed 0.
+    // raftZ = 0: supports stay in the same world frame as the geometry, and the
+    // bridge shifts both by one offset so they stay locked. Normalising here
+    // would desync them by the raft thickness.
     const raftZ = 0;
 
-    // Track each built pillar so braces can attach to the right shaft. A brace
-    // endpoint lands on a pillar's XY; we match by nearest XY and reference that
-    // trunk's lower shaft segment (root → knot), placing the brace knot at the
-    // authored brace-endpoint Z.
-    // Track each built pillar's segments (with world-space endpoints) so a brace
-    // endpoint can attach to the CLOSEST segment in 3D — mirroring the host's
-    // findClosestSegment — rather than always the lower segment. For most braces
-    // the lower (root→knot) segment is correct, but an endpoint high on the pillar
-    // can fall on the knot→tip segment; picking per-endpoint keeps our attachment
-    // consistent with what the interactive snap would choose.
+    // Track each pillar's segments with world endpoints so a brace attaches to
+    // the closest segment in 3D, matching the host's findClosestSegment. An
+    // endpoint high on a pillar belongs to the upper segment, not the lower.
     interface SegRef {
       segmentId: string;
       start: Vec3; // world-space segment start (lower)
@@ -669,19 +542,14 @@ export class CbxConverter {
       segments: SegRef[];
     }
     const shaftRefs: ShaftRef[] = [];
-    // Fork-junction trunks: built as normal trunks so all tip/branch/leaf logic
-    // works, but their base is mid-air (held by converging braces, not the plate).
-    // We record them here and, AFTER braces create the convergence knots, re-anchor
-    // each to a convergence knot and drop its floating root — otherwise the host's
-    // SmartPlacementV2 sees a root off the plate and re-routes it down, spiking
-    // through the model.
+    // Fork-junction trunks build as normal trunks but sit mid-air. Recorded here
+    // and re-anchored to a convergence knot after braces create them: a root off
+    // the plate makes the host re-route it down through the model.
     const forkJunctionTrunks: Array<{ trunk: Trunk; rootId: string; basePos: Vec3 }> = [];
 
-    // Pre-pass: classify each support's tips into model-contact tips vs
-    // support-to-support brace tips (a Chitubox cross-brace lands a tip on a
-    // neighbouring shaft, not the model). Brace tips are collected and emitted as
-    // DragonFruit Braces after the shafts exist; importing them as model cones would
-    // tunnel through the model to reach empty space (the "arch through the foot").
+    // Split tips into model contacts and cross-brace tips landing on a
+    // neighbouring shaft. The latter are emitted as Braces once the shafts
+    // exist; as model cones they would tunnel to empty space.
     const pendingSupportBraces: Array<{
       sourcePillarX: number; sourcePillarY: number;
       targetPillarX: number; targetPillarY: number;
@@ -710,11 +578,9 @@ export class CbxConverter {
 
     for (const s of supportsForBuild) {
       try {
-        // A support with a downward contact spans between two parts of the
-        // model rather than standing on the plate: DragonFruit models that as a
-        // Stick, whose two contact cones are the downward tip and the upward tip
-        // best continuing the shaft's line, with the pillar as its body. Any
-        // remaining upward tips fan off the hub knot as leaves.
+        // A downward contact means the support spans two parts of the model
+        // rather than standing on the plate, which DragonFruit models as a
+        // Stick. Remaining upward tips fan off the hub knot as leaves.
         if (s.downwardTip && s.tips.length > 0) {
           const stick = buildStick(s, placeholderModelId, raftZ, tipDefaults, mesh);
           if (stick) {
@@ -745,11 +611,9 @@ export class CbxConverter {
           });
         }
 
-        // Reconstruct each segment's world endpoints from its joints, matching how
-        // the host's getTrunkSegmentEndpoints derives them:
-        //   - segment start: bottomJoint.pos, else (index 0) the root top, else
-        //     the previous segment's topJoint.
-        //   - segment end:   topJoint.pos, else the contact-cone socket.
+        // Segment world endpoints, derived as the host's
+        // getTrunkSegmentEndpoints does: start from bottomJoint, else the root
+        // top or previous topJoint; end at topJoint, else the cone socket.
         const px = s.pillarX;
         const py = s.pillarY;
         const rootTopZ = built.root.transform.pos.z
@@ -797,18 +661,10 @@ export class CbxConverter {
     /**
      * Resolve the pillar a brace endpoint attaches to.
      *
-     * XY alone is NOT enough. On stacked-tier models (Supported_Chest_Back) 148 of
-     * 534 brace endpoints have two or more pillars inside the 1mm XY tolerance --
-     * tiers sitting almost directly above one another, e.g. z-spans
-     * [-50.48..-40.37] and [-43.30..-39.95] at the same XY. Picking by XY distance
-     * alone can bind the endpoint to the wrong tier, and the brace then stretches
-     * from its authored end to a shaft somewhere else entirely: the "really long
-     * super brace" artefact. Authored braces on this model are all short 45deg
-     * struts (max dXY 6.28mm, dz == dXY), so any long result is manufactured.
-     *
-     * Scoring the endpoint in 3D against each candidate's actual SEGMENTS picks the
-     * tier that truly contains it, because a pillar whose Z span excludes the
-     * endpoint scores its (large) distance to the nearer segment end.
+     * XY alone is not enough: on stacked tiers several pillars sit inside the
+     * tolerance, and binding to the wrong one stretches the brace across the
+     * model. Scoring in 3D against each candidate's segments picks the tier that
+     * actually contains the endpoint.
      */
     const nearestShaft = (x: number, y: number, z?: number): ShaftRef | null => {
       let best: ShaftRef | null = null;
@@ -871,6 +727,34 @@ export class CbxConverter {
       return best!;
     };
 
+    // A projection clamped to a segment end that still lands far from it means
+    // the authored point lies beyond the shaft: the nearest-shaft guess was
+    // wrong. Marking such knots 'project' draws them on the shaft their t
+    // refers to, rather than at a point with no shaft under it.
+    const BRACE_ENDPOINT_PRESERVE_TOL_MM = 0.5;
+    const braceProjectionIsUnreliable = (
+      authored: Vec3,
+      proj: { t: number; pos: Vec3 },
+    ): boolean => {
+      const clampedToEnd = proj.t <= 1e-4 || proj.t >= 1 - 1e-4;
+      if (!clampedToEnd) return false;
+      const dx = proj.pos.x - authored.x;
+      const dy = proj.pos.y - authored.y;
+      const dz = proj.pos.z - authored.z;
+      return Math.sqrt(dx * dx + dy * dy + dz * dz) > BRACE_ENDPOINT_PRESERVE_TOL_MM;
+    };
+    const braceKnotPos = (authored: Vec3, proj: { t: number; pos: Vec3 }): Vec3 => (
+      braceProjectionIsUnreliable(authored, proj)
+        ? { x: proj.pos.x, y: proj.pos.y, z: proj.pos.z }
+        : authored
+    );
+    const braceKnotHint = (
+      authored: Vec3,
+      proj: { t: number; pos: Vec3 },
+    ): Knot['_importHint'] => (
+      braceProjectionIsUnreliable(authored, proj) ? 'project' : 'braceImported'
+    );
+
     for (const b of modelBraces) {
       // Pass Z so a stacked tier cannot be mis-picked (see nearestShaft).
       const shaftA = nearestShaft(b.ax, b.ay, b.az - raftZ);
@@ -897,24 +781,21 @@ export class CbxConverter {
         id: uuidv4(),
         parentShaftId: projA.segmentId,
         t: projA.t,
-        pos: endpointA,
+        pos: braceKnotPos(endpointA, projA),
         diameter: jointDiameter,
-        _importHint: 'braceImported',
+        _importHint: braceKnotHint(endpointA, projA),
       };
       const knotB: Knot = {
         id: uuidv4(),
         parentShaftId: projB.segmentId,
         t: projB.t,
-        pos: endpointB,
+        pos: braceKnotPos(endpointB, projB),
         diameter: jointDiameter,
-        _importHint: 'braceImported',
+        _importHint: braceKnotHint(endpointB, projB),
       };
-      // Sanity: a rebuilt brace must stay close to its AUTHORED span. The knots
-      // are projected onto their host shafts, so a mis-resolved tier shows up as a
-      // rebuilt strut far longer than the record describes. Authored braces on
-      // these files are short 45deg struts (Supported_Chest_Back: max 6.28mm), so
-      // a large overshoot means the endpoint bound to the wrong pillar -- drop it
-      // rather than draw a girder across the model.
+      // A rebuilt brace must stay close to its authored span. Authored braces
+      // are short 45deg struts, so a large overshoot means the endpoint bound to
+      // the wrong pillar; drop it rather than draw a girder across the model.
       const authoredLen = Math.hypot(
         endpointB.x - endpointA.x, endpointB.y - endpointA.y, endpointB.z - endpointA.z,
       );
@@ -953,12 +834,8 @@ export class CbxConverter {
     }
 
     // --- Support-to-support braces (from reclassified tips) ---
-    // Each pending brace connects the SOURCE support's shaft to the TARGET support's
-    // shaft at the authored contact point. We project the contact onto the target
-    // pillar (where the tip landed) and project a source point onto the source pillar,
-    // then link them with a DragonFruit Brace — the same primitive used for authored
-    // sub-3 braces. This replaces a model cone that would otherwise tunnel to the
-    // off-model contact.
+    // Project the contact onto the target pillar and a matching point onto the
+    // source pillar, then link them with a Brace.
     let supportBracesEmitted = 0;
     for (const pb of pendingSupportBraces) {
       // The authored contact height is the attach Z for both ends of this strut,
@@ -1009,14 +886,9 @@ export class CbxConverter {
     }
 
     // --- Fork-junction re-anchoring ---
-    // A fork-junction trunk's base sits mid-air where braces converge. We built it
-    // as a normal trunk on a zero-size root so its tips/branches/leaves form
-    // correctly, but a root off the plate makes the host's SmartPlacementV2 re-route
-    // the support down to the plate (spiking through the model). Now that the
-    // converging braces have dropped knots at the convergence point, re-anchor each
-    // fork trunk to the nearest convergence knot — its bottom segment becomes parented
-    // to that knot (a branch off the brace network) — and drop the floating root so
-    // the host no longer tries to ground it.
+    // Now the converging braces have dropped knots at the convergence, re-anchor
+    // each fork trunk to the nearest one and drop its floating root, so the host
+    // stops trying to ground it.
     let forksReanchored = 0;
     let forksRedirectedToPartner = 0;
     if (forkJunctionTrunks.length > 0) {
@@ -1036,10 +908,9 @@ export class CbxConverter {
         return null;
       };
       for (const fork of forkJunctionTrunks) {
-        // Anchor onto the nearest BRACE-convergence knot at the fork base. We key off
-        // "a brace references this knot" rather than shaft ownership, because the
-        // converging braces drop their knots onto the fork's own base segment — those
-        // are exactly the knots we want, so excluding by shaft would miss them.
+        // Anchor onto the nearest brace-convergence knot at the fork base. Keyed
+        // on brace reference rather than shaft ownership: converging braces drop
+        // their knots onto the fork's own base segment.
         let best: Knot | null = null;
         let bestD = Infinity;
         for (const k of knots) {
@@ -1050,19 +921,11 @@ export class CbxConverter {
         // Only re-anchor if a convergence knot is genuinely at the base (within 2mm).
         if (!best || bestD > 2.0) continue;
 
-        // The nearest-knot search above is keyed only on "a brace references this
-        // knot", not on which shaft hosts it — so it almost always finds the LOCAL
-        // knot the converging brace dropped on the fork's OWN base segment (it's
-        // trivially the closest possible point to itself), not the genuine knot on
-        // the OTHER pillar the brace actually connects to. Anchoring directly to that
-        // local knot makes the branch its own parent: a self-reference that the
-        // host's trunk-resolution walk can never escape (it renders fine — preserved
-        // knots draw at their authored position regardless — but never resolves to a
-        // trunk, so editing/selection logic that walks the parent chain breaks).
-        // When the chosen knot is self-hosted, follow its brace to the other endpoint
-        // and re-host a NEW knot at the SAME convergence position onto that external
-        // shaft instead — same geometry, but a parent chain that actually leads
-        // somewhere.
+        // The search above is keyed on brace reference, not host shaft, so it
+        // usually finds the knot on the fork's OWN base segment -- making the
+        // branch its own parent, a self-reference the trunk-resolution walk
+        // cannot escape. Where the knot is self-hosted, re-host a new one at the
+        // same position on the brace's other shaft.
         let anchorKnot = best;
         const isSelfHosted = fork.trunk.segments.some((s) => s.id === best!.parentShaftId);
         if (isSelfHosted) {
@@ -1095,11 +958,8 @@ export class CbxConverter {
           pos: { x: anchorKnot.pos.x, y: anchorKnot.pos.y, z: anchorKnot.pos.z },
           diameter: anchorKnot.diameter ?? getJointDiameter(bottomSeg.diameter),
         };
-        // Emit the fork as a BRANCH (parented to the convergence knot), not a trunk.
-        // The host routes every trunk through SmartPlacementV2, which always grounds
-        // to the plate — wrong for a junction held mid-air by braces, and the cause
-        // of the spikes through the model. A branch is built parented to its knot and
-        // is never grounded, so the junction stays where Chitubox authored it.
+        // Emit the fork as a Branch, not a trunk: the host grounds every trunk
+        // to the plate, which is wrong for a junction held mid-air by braces.
         const forkBranch: Branch = {
           id: fork.trunk.id,
           modelId: fork.trunk.modelId,
@@ -1129,14 +989,9 @@ export class CbxConverter {
     }
 
     // --- Brace-fed junction branches (multi-level support trees). ---
-    // A junction is a tip-bearing knot with NO pillar of its own, reached by a
-    // single diagonal brace from a grounded pillar's knot, with its tips fanning
-    // out to the model. The flat pillar→knot→tips model drops these entirely, so
-    // we rebuild each as a DragonFruit Branch: parented to the pillared knot the
-    // brace comes from (resolved onto that pillar's shaft so the host can recompute
-    // it), its first segment runs up to the junction, and the tips become contact
-    // cones (primary on the branch; extras as sub-branches off a knot at the
-    // junction). This recovers the whole upper tier of the support tree.
+    // A junction is a tip-bearing knot with no pillar of its own, reached by one
+    // diagonal brace. Rebuilt as a Branch parented to the knot that brace comes
+    // from, with its tips as contact cones.
     const modelJunctions = model.junctionBranches ?? [];
     let junctionBranchesBuilt = 0;
     let junctionTipsBuilt = 0;
@@ -1165,13 +1020,8 @@ export class CbxConverter {
 
       if (jb.tips.length === 0) { junctionDropped++; continue; }
 
-      // Native junction (Option A, same as multi-tip trunks): a Branch runs from the
-      // parent knot (on the grounded pillar's shaft) up to a terminal joint at the
-      // JUNCTION, a single knot sits at that junction on the branch shaft, and EVERY
-      // junction tip becomes a Leaf radiating from that knot. No mid-junction joint
-      // with cones fanning off at an angle — that produced the kink. The branch shaft
-      // simply carries the load up to the junction knot, and the tips hang off it as
-      // leaves, exactly as DF would if the junction had been hand-placed.
+      // A Branch runs from the parent knot up to a terminal joint at the
+      // junction; one knot sits there and every junction tip is a Leaf off it.
       const junctionTerminalJoint: Joint = {
         id: uuidv4(),
         pos: junctionPos,
@@ -1194,14 +1044,9 @@ export class CbxConverter {
       branches.push(junctionBranch);
       junctionBranchesBuilt++;
 
-      // The single junction knot, riding the branch segment at the junction.
-      // NOTE: must NOT share the `junctionPos` object with junctionTerminalJoint
-      // above. applyZShift/applyXYShift dedupe JOINTS by id but iterate knots
-      // separately assuming each knot owns a distinct pos object; a shared ref is
-      // shifted once as the segment topJoint AND again as a knot, double-shifting
-      // the whole upper junction tier by (plateX, plateY, -raftZ) into the model.
-      // Clone the position so each structure owns its own pos (matches the working
-      // multi-tip trunk path, which builds a fresh sharedKnotPos for its knot).
+      // Clone the position rather than sharing junctionPos: the cluster
+      // transforms dedupe joints by id but iterate knots separately, so a shared
+      // ref is shifted twice.
       const junctionKnot: Knot = {
         id: uuidv4(),
         parentShaftId: branchSeg.id,
@@ -1240,33 +1085,16 @@ export class CbxConverter {
       });
     }
 
-    // --- Twigs (sub-12): tiny model-to-model struts. ---
-    // A twig is a short body bridging two contact points on the model. We build it
-    // to match the host's own buildTwig EXACTLY (SupportTypes/Twig/twigBuilder.ts):
-    //   - a minimal disk-type ContactDiskProfile (type + the 3 disk fields only),
-    //   - real per-endpoint surface normals recovered from the model mesh (the
-    //     authored format stores none), used to orient each disk INTO the model,
-    //   - the shaft running between two joints that sit OFF the surface by the
-    //     disk stand-off along each surface normal,
-    //   - joints sized 1.1x the disk contact diameter, and diskLengthOverride set.
-    // Matching the canonical builder removes every structural variable: the disks
-    // face the model (not along the strut) and the twig renders like a native one.
+    // --- Twigs (sub-12): short struts bridging two model contacts. ---
+    // Built to match the host's buildTwig: disks oriented by real surface
+    // normals from the mesh, joints standing off the surface along them.
     const modelTwigs = model.twigs ?? [];
     const twigs: Twig[] = [];
 
-    // Recover the model surface normal at a contact point. The contact sits ON the
-    // model; we want the normal of the face it actually rests on, oriented OUT of the
-    // solid (the direction the twig disk stands off). The earlier approach cast a
-    // single ray ALONG the strut to find that face — but for a twig whose strut runs
-    // nearly tangent to the surface (e.g. a contact on a near-horizontal overhang),
-    // that ray skims past the local face and hits a DIFFERENT wall, yielding a normal
-    // anti-aligned with the true surface. The disk cap then faces empty space instead
-    // of lying flat on the model — the "disk sitting outside the model" artefact.
-    //
-    // Instead, probe in MANY directions and take the NEAREST hit face: that is the
-    // surface the contact rests on, regardless of strut orientation. Then orient the
-    // face normal outward with an inside/outside test. Raycast-only (no BVH needed),
-    // matching the rest of the converter. Falls back to the strut axis on no mesh/hit.
+    // Surface normal at a contact, oriented out of the solid. Probes in many
+    // directions and takes the nearest hit: a single ray along the strut skims
+    // past the local face where the strut runs near-tangent to the surface.
+    // Falls back to the strut axis with no mesh or no hit.
     const STANDOFF_PROBE_MM = 0.6;
     const pointInsideModel = (p: THREE.Vector3): boolean => {
       if (!mesh) return false;
@@ -1291,11 +1119,9 @@ export class CbxConverter {
       [0, 1, 1], [0, -1, 1], [0, 1, -1], [0, -1, -1],
     ];
     const PROBE_BACKOFF_MM = 0.4;
-    // Returns the outward surface normal AND the snapped surface position (the
-    // actual mesh hit point). The authored CBX twig endpoint can sit a fraction
-    // of a mm off the mesh surface; snapping to the hit position — the same
-    // technique createContactAssembly uses for tip contacts — ensures the disk
-    // face is flush with the model surface rather than floating below it.
+    // Returns the outward normal and the snapped mesh hit point. Authored twig
+    // endpoints can sit a fraction off the surface, so snapping keeps the disk
+    // flush rather than floating.
     const recoverSurfaceContact = (contact: Vec3, _towardOther: Vec3, fallback: Vec3): { normal: Vec3; surfacePos: Vec3 | null } => {
       if (!mesh) return { normal: fallback, surfacePos: null };
       const raycaster = new THREE.Raycaster();
@@ -1434,18 +1260,11 @@ export class CbxConverter {
       console.log(`${LOG_PREFIX} twigs`, { total: modelTwigs.length });
     }
 
-    // --- Leaf sanity pass ---------------------------------------------------
-    // A Leaf is a shaft-less cone straight from the knot to the contact, valid only
-    // when the knot is ~one tip-length from the contact. Some leaves are classified
-    // when their knot is close, but the knot is later relocated (junction composition,
-    // shaft splits) so the final knot→contact distance is much larger. A long leaf
-    // has no shaft to follow the surface and tunnels straight through the model.
-    // Here we re-check every leaf against its FINAL knot position and convert any
-    // over-long one into a Branch (shaft knot→socket + short native cone), which
-    // approaches the contact along the surface instead of cutting through.
-    //
-    // Stick-hub leaves are EXEMPT: their knot is authored at the hub and never
-    // relocated, so a long knot→contact distance is the intended fan, not drift.
+    // --- Leaf sanity pass ---
+    // A Leaf is a shaft-less cone, valid only while its knot sits about one
+    // tip-length from the contact; later relocation can stretch that into a leaf
+    // that tunnels through the model. Stick-hub leaves are exempt, their knot
+    // never moves.
     {
       const knotById = new Map(knots.map((k) => [k.id, k]));
       const tipLen = CBX_TIP_DEFAULTS.lengthMm;
@@ -1460,8 +1279,8 @@ export class CbxConverter {
         if (knotToContact <= tipLen + LEAF_MAX_SHAFT_MM) { keptLeaves.push(leaf); continue; }
 
         // Over-long: rebuild as a Branch. Re-solve a short native cone + socket from
-        // the knot toward the contact via createContactAssembly (the LYS contract),
-        // so the cone is a short tip near the contact and the shaft carries the rest.
+        // the knot toward the contact, so the cone is a short tip and the shaft
+        // carries the rest.
         const shaftDia = (cc.profile as any)?.bodyDiameterMm
           ? Math.max((cc.profile as any).bodyDiameterMm, 0.8)
           : 0.8;
@@ -1492,12 +1311,9 @@ export class CbxConverter {
       }
     }
 
-    // --- Knot-centering / merge sanity pass ---------------------------------
-    // Resolve clusters of near-coincident brace knots on the same shaft down to one
-    // shared knot, so authored brace scatter doesn't leave a fan of attach points
-    // (each independently tracking its own diameter and able to drift out of sync
-    // on a later edit) where the host renders a single clean attachment in Chitubox.
-    // Contact (leaf/branch) knots are used as anchors but never moved or merged away.
+    // --- Knot-centering / merge sanity pass ---
+    // Merge clusters of near-coincident brace knots on one shaft into a single
+    // attachment. Contact knots anchor but are never moved.
     {
       const braceKnotIds = new Set<string>();
       for (const br of braces) {
@@ -1528,12 +1344,10 @@ export class CbxConverter {
       }
     }
 
-    // --- Degenerate-joint collapse pass ------------------------------------
-    // Remove near-zero-length shaft stubs whose two end joints would render as a
-    // lump of overlapping spheres at a trunk top / branch attach point. Structural
-    // only: the contact cone's socket joint (and therefore every tip contact) is
-    // preserved; we only drop the redundant lower joint and re-point any riding
-    // knots onto the merged segment.
+    // --- Degenerate-joint collapse pass ---
+    // Remove near-zero-length stubs whose end joints render as overlapping
+    // spheres. The cone's socket joint is preserved; riding knots are
+    // re-pointed onto the merged segment.
     {
       const collapsed = collapseDegenerateJoints({ trunks, branches, knots });
       if (CBX_DEBUG && collapsed > 0) {
@@ -1541,12 +1355,24 @@ export class CbxConverter {
       }
     }
 
+    // --- Coincident-joint dedup ---
+    // Two distinct joint objects at one point render as one sphere but drag
+    // apart. Reference-shared joints are left alone.
+    {
+      const deduped = dedupeCoincidentJoints({
+        supports: [...trunks, ...branches, ...twigs, ...sticks],
+        knots,
+      });
+      if (CBX_DEBUG && deduped > 0) {
+        cbxDebug(`joint-dedup pass: merged ${deduped} coincident joint(s)`);
+      }
+    }
+
     const result: DragonfruitImportFormat = {
       version: 1,
       meta: {
         source: model.filename ? `chitubox:${model.filename}` : 'chitubox_conversion',
-        // Match LYS parity: the host expects {0,0,0} here (LysConverter hardcodes
-        // it). The model mesh carries its own world position.
+        // The host expects {0,0,0}; the model mesh carries its own position.
         objectCenter: { x: 0, y: 0, z: 0 },
         updatedAt: Date.now(),
       },
@@ -1626,16 +1452,11 @@ export class CbxConverter {
 
   /**
    * Rewrites all converted entities to a single target model id. Called by the
-   * file-type bridge after conversion, matching LysConverter.reassignModelId.
+   * file-type bridge after conversion.
    *
-   * EVERY top-level support entity is a SupportEntity (carries its own modelId),
-   * so all of them must be reassigned — not just roots/trunks/branches. Missing
-   * an entity type leaves it tagged with the placeholder model id from convert(),
-   * which belongs to no displayed model: the host's support tab filters
-   * interactable supports per model, so a mis-tagged entity renders as static
-   * geometry but cannot be selected, and per-model model drags don't move it.
-   * (This was the brace "renders but won't connect / won't move" bug — braces
-   * were the one emitted type the old reassign skipped.)
+   * Every emitted type must be covered: one left on convert()'s placeholder id
+   * belongs to no displayed model, so it renders but cannot be selected or
+   * dragged.
    */
   static reassignModelId(data: DragonfruitImportFormat, modelId: string): void {
     if (!modelId) return;
@@ -1656,21 +1477,12 @@ export class CbxConverter {
   }
 
   /**
-   * Shift every support entity in Z by `deltaZ`. Used to move converted supports
-   * into the same frame the host places the model in.
-   *
-   * Background: the host centers the model geometry's bounding box at the origin
-   * and places it from there — it does NOT honour a transform-Z we provide, and
-   * it does not move the supports with the model. So to keep supports locked to
-   * the model, the bridge shifts them by the model's bbox-center Z (see
-   * fileTypeHandlers). This is the CBX analogue of LYS's applySupportZOffset.
-   *
-   * Walks every Z-bearing field: Roots transform, Trunk/Branch segment joints,
-   * contact-cone positions, and Knots. Joints shared across segments are shifted
-   * once via an id set.
+   * Shift every support entity in Z by `deltaZ`. The host centers the model's
+   * bbox at the origin and does not move supports with it, so the bridge shifts
+   * them by the same amount to keep the two locked. Joints shared across
+   * segments are shifted once.
    */
-  // Cluster transform operations live in converter/clusterTransform; these static
-  // methods delegate to them to preserve the existing CbxConverter.* public API.
+  // These delegate to converter/clusterTransform, preserving the public API.
   static applyZShift(data: DragonfruitImportFormat, deltaZ: number): void {
     clusterApplyZShift(data, deltaZ);
   }
