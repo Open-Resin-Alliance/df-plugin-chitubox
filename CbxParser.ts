@@ -146,48 +146,8 @@ function readRecord(view: DataView, base: number): RawRecord {
   };
 }
 
-/** Search for a little-endian uint32 value in bytes within [from, to). */
-function indexOfU32(bytes: Uint8Array, value: number, from: number, to?: number): number {
-  const b0 = value & 0xff;
-  const b1 = (value >>> 8) & 0xff;
-  const b2 = (value >>> 16) & 0xff;
-  const b3 = (value >>> 24) & 0xff;
-  const end = (to ?? bytes.length) - 3;
-  for (let i = Math.max(0, from); i < end; i++) {
-    if (bytes[i] === b0 && bytes[i + 1] === b1 && bytes[i + 2] === b2 && bytes[i + 3] === b3) {
-      return i;
-    }
-  }
-  return -1;
-}
 
-/** Collect every TAG_EA offset from `from` to end of buffer. */
-function allTagOffsets(bytes: Uint8Array, from: number): number[] {
-  const out: number[] = [];
-  let p = from;
-  while (true) {
-    const i = indexOfU32(bytes, TAG_EA, p);
-    if (i === -1) break;
-    out.push(i);
-    p = i + 1;
-  }
-  return out;
-}
 
-/**
- * Split sorted TAG offsets into blocks (one per model instance's record group).
- * A gap larger than REC_SIZE*2 between consecutive tags starts a new block.
- */
-function splitBlocks(tags: number[]): number[] {
-  if (tags.length === 0) return [];
-  const starts = [tags[0]];
-  for (let i = 0; i < tags.length - 1; i++) {
-    if (tags[i + 1] - tags[i] > REC_SIZE * 2) {
-      starts.push(tags[i + 1]);
-    }
-  }
-  return starts;
-}
 
 /**
  * Debug side-channel: when set, `parseBuffer` records the resolved coordinates of
@@ -622,17 +582,6 @@ function parseSupportBlock(
   // brace stores world endpoints (az/bz); a fork junction is where ≥2 of them meet
   // the base of an otherwise-ungrounded pillar.
   const MID_AIR_MM = 1.5; // base must be this far above the plate to count as mid-air
-  const CONV_XY_MM = 0.4;
-  const CONV_Z_MM = 0.6;
-  const convergingBraceCount = (px: number, py: number, pz: number): number => {
-    let n = 0;
-    for (const br of braces) {
-      if (Math.hypot(br.ax - px, br.ay - py) <= CONV_XY_MM && Math.abs(br.az - pz) <= CONV_Z_MM) n++;
-      if (Math.hypot(br.bx - px, br.by - py) <= CONV_XY_MM && Math.abs(br.bz - pz) <= CONV_Z_MM) n++;
-    }
-    return n;
-  };
-
   // A fork junction: a pillar whose base is mid-air, has NO base pad / foot of its
   // own, and has ≥2 braces converging at that base. Such pillars are branches
   // growing out of the convergence, not grounded trunks. (Per the support model,
@@ -802,54 +751,6 @@ function parseSupportBlock(
   return { supports, braces: filteredBraces, twigs, junctionBranches };
 }
 
-/**
- * Scan for the record table and return the earliest geometry offset it declares,
- * or null if no plausible table is found. Used for files without a usable
- * meshOffset, where this is the only way to find where geometry begins.
- */
-function earliestGeometryStart(
-  view: DataView,
-  len: number,
-  nInstances: number,
-  tablePtr = 0,
-): number | null {
-  const TAIL_OFF = 256;
-  const STRIDE_OFF = 680;
-
-  const recValid = (recBase: number): boolean => {
-    const tail = recBase + TAIL_OFF;
-    if (recBase < 0 || tail + 28 > len) return false;
-    const gs = u32(view, tail + 16);
-    const bc = u32(view, tail + 20);
-    return (
-      gs > 0 && gs < len && bc > 0 && gs + bc <= len
-      && bc % 36 === 0 && bc / 36 >= MIN_PROBE_TRIS
-    );
-  };
-
-  // The scan below only reaches ABS_PROBE_LIMIT; a table beyond that is found
-  // only via the header pointer.
-  const candidates: number[] = [];
-  if (tablePtr > 0 && tablePtr < len) candidates.push(tablePtr);
-  for (let base = 0; base < Math.min(ABS_PROBE_LIMIT, len); base += 4) candidates.push(base);
-
-  for (const base of candidates) {
-    if (!recValid(base)) continue;
-    if (nInstances >= 2 && !recValid(base + STRIDE_OFF)) continue;
-    let earliest = len;
-    for (let k = 0; k < nInstances; k++) {
-      const tail = base + k * STRIDE_OFF + TAIL_OFF;
-      if (tail + 28 > len) break;
-      const gs = u32(view, tail + 16);
-      const bc = u32(view, tail + 20);
-      if (gs > 0 && gs < len && bc > 0 && gs + bc <= len && gs < earliest) {
-        earliest = gs;
-      }
-    }
-    return earliest < len ? earliest : null;
-  }
-  return null;
-}
 
 /**
  * Read a flat 36-byte-triangle geometry region into a non-indexed position
@@ -1088,7 +989,6 @@ export class CbxParser {
     // floats: a sweep cannot tell a plate coordinate from a Z, and support
     // blocks do not reliably precede geometry.
     let minZ = 0.0;
-    let sawSupportRecord = false;
     for (let k = 0; k < nInstances; k++) {
       const tail = REC_BASE + k * STRIDE + TAIL;
       if (tail + 28 > len) break;
@@ -1100,7 +1000,6 @@ export class CbxParser {
       for (; rb + REC_SIZE <= len && u32(view, rb) === TAG_EA; rb += REC_SIZE) {
         const sub = u32(view, rb + 4);
         if (sub === SUMMARY_SUB) continue; // sentinel Z values, not geometry
-        sawSupportRecord = true;
         const topZ = f32(view, rb + 16);
         const botZ = f32(view, rb + 28);
         for (const z of [topZ, botZ]) {
@@ -1124,7 +1023,6 @@ export class CbxParser {
         }
       }
     }
-    const hasSupports = sawSupportRecord;
     const zOff = -minZ;
 
 

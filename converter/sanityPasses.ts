@@ -355,7 +355,6 @@ export function collapseDegenerateJoints(input: JointCollapseInput): number {
       if (jointDist(bot, top) > DEGENERATE_SEGMENT_MM) continue;
 
       // Decide which joint survives. Never drop the cone's socket joint.
-      const topIsSocket = socketJointId !== undefined && top.id === socketJointId;
       const botIsSocket = socketJointId !== undefined && bot.id === socketJointId;
       // Keeper defaults to the UPPER joint (toward the cone); if the LOWER one is the
       // socket, keep that instead so the cone reference and its position are intact.

@@ -1,6 +1,5 @@
 import * as THREE from 'three';
 import type { PluginFileTypeHandler } from '@/features/plugins/pluginFileTypeBridge';
-import type { PluginFileTypeDefinition } from '@/features/plugins/complexPluginContracts';
 import { CbxParser } from './CbxParser';
 import { CbxConverter, computeRaftZ, type CbxModelInput } from './CbxConverter';
 import { createDefaultSettings } from '@/supports/Settings/types';
@@ -138,7 +137,7 @@ function convertSingleModel(
     raycastMesh.updateMatrixWorld(true);
   }
 
-  let dragonfruitData = CbxConverter.convert(model, settings, raycastMesh);
+  const dragonfruitData = CbxConverter.convert(model, settings, raycastMesh);
   if (dragonfruitData) {
     CbxConverter.reassignModelId(dragonfruitData, importedModelId);
   }
@@ -328,10 +327,7 @@ export async function importCbxFile(
 // Plugin file-type handler (required export for fileType capability)
 // ---------------------------------------------------------------------------
 
-export const handleFileTypeImport: PluginFileTypeHandler = async (
-  file: File,
-  _fileTypeDefinition: PluginFileTypeDefinition,
-) => {
+export const handleFileTypeImport: PluginFileTypeHandler = async (file: File) => {
   try {
     const result = await importCbxFile(file);
     return { success: true, payload: result };

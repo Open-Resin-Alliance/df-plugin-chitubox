@@ -17,8 +17,6 @@ import {
 import { SupportSettings } from '@/supports/Settings';
 import { getJointDiameter } from '@/supports/constants';
 import { calculateDiskThickness } from '@/supports/SupportPrimitives/ContactDisk/contactDiskUtils';
-import { recomputeLeafContactConeAxisAndLength } from '@/supports/state';
-import { ContactCone } from '@/supports/SupportPrimitives/ContactCone/types';
 import { createContactAssembly } from './converter/contactAssembly';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -39,13 +37,7 @@ import {
   CBX_ROOT_DEFAULTS,
   CBX_SHAFT_DEFAULTS,
   CBX_BRACE_ATTACH_TOL_MM,
-  CbxTip,
-  CbxBasePad,
   CbxSupport,
-  CbxTransform,
-  CbxBrace,
-  CbxTwig,
-  CbxJunctionBranch,
   CbxModelInput,
 } from './converter/types';
 export type {
@@ -73,9 +65,7 @@ import {
   synthSupportForTip,
   synthTipSettings,
   buildTipFromKnot,
-  buildNativeBranch,
   applyTrunkDiameterProfile,
-  computeLinearTLocal,
   LEAF_MAX_SHAFT_MM,
 } from './converter/geometryHelpers';
 import {
@@ -202,7 +192,6 @@ function buildStick(
   const stickSegment = stick.segments[0];
   // Both joints are set when the stick is built above; fall back to the hub
   // endpoints so the type's optionality does not need an assertion.
-  const segStart = stickSegment.bottomJoint?.pos ?? hubBottom;
   const segEnd = stickSegment.topJoint?.pos ?? hubTop;
 
   // Hub knot, matching the native sprout-leaf flow: pos and diameter come from
@@ -335,7 +324,6 @@ function buildSupport(
   }
 
   const [primaryTip, ...extraTips] = s.tips;
-  const isMultiTip = extraTips.length > 0;
   const rootTopZ = root.transform.pos.z + (root.diskHeight ?? 0) + (root.coneHeight ?? 0);
   const knotJointDiameter = Number.isFinite(s.knotDiameter) && s.knotDiameter > 0
     ? s.knotDiameter
@@ -448,36 +436,42 @@ function buildSupport(
   return { root, trunk, knots, branches, leaves, fanLeafIds: [...fanLeafIds] };
 }
 
+/** A settings field is only usable when it is actually a finite number: the
+ *  profile types make most of them optional. */
+function finiteOr(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
 /** Resolve tip defaults from live settings if provided, else module fallback. */
 function resolveTipDefaults(settings?: SupportSettings): typeof CBX_TIP_DEFAULTS {
-  const t = (settings as any)?.tip;
+  const t = settings?.tip;
   if (!t) return CBX_TIP_DEFAULTS;
   return {
-    lengthMm: Number.isFinite(t.lengthMm) ? t.lengthMm : CBX_TIP_DEFAULTS.lengthMm,
-    bodyDiameterMm: Number.isFinite(t.bodyDiameterMm) ? t.bodyDiameterMm : CBX_TIP_DEFAULTS.bodyDiameterMm,
-    contactDiameterMm: Number.isFinite(t.contactDiameterMm) ? t.contactDiameterMm : CBX_TIP_DEFAULTS.contactDiameterMm,
-    diskThicknessMm: Number.isFinite(t.diskThicknessMm) ? t.diskThicknessMm : CBX_TIP_DEFAULTS.diskThicknessMm,
-    maxStandoffMm: Number.isFinite(t.maxStandoffMm) ? t.maxStandoffMm : CBX_TIP_DEFAULTS.maxStandoffMm,
-    standoffAngleThreshold: Number.isFinite(t.standoffAngleThreshold) ? t.standoffAngleThreshold : CBX_TIP_DEFAULTS.standoffAngleThreshold,
-    penetrationMm: Number.isFinite(t.penetrationMm) ? t.penetrationMm : CBX_TIP_DEFAULTS.penetrationMm,
+    lengthMm: finiteOr(t.lengthMm, CBX_TIP_DEFAULTS.lengthMm),
+    bodyDiameterMm: finiteOr(t.bodyDiameterMm, CBX_TIP_DEFAULTS.bodyDiameterMm),
+    contactDiameterMm: finiteOr(t.contactDiameterMm, CBX_TIP_DEFAULTS.contactDiameterMm),
+    diskThicknessMm: finiteOr(t.diskThicknessMm, CBX_TIP_DEFAULTS.diskThicknessMm),
+    maxStandoffMm: finiteOr(t.maxStandoffMm, CBX_TIP_DEFAULTS.maxStandoffMm),
+    standoffAngleThreshold: finiteOr(t.standoffAngleThreshold, CBX_TIP_DEFAULTS.standoffAngleThreshold),
+    penetrationMm: finiteOr(t.penetrationMm, CBX_TIP_DEFAULTS.penetrationMm),
   };
 }
 
 function resolveRootDefaults(settings?: SupportSettings): typeof CBX_ROOT_DEFAULTS {
-  const r = (settings as any)?.roots;
+  const r = settings?.roots;
   if (!r) return CBX_ROOT_DEFAULTS;
   return {
-    diameterMm: Number.isFinite(r.diameterMm) ? r.diameterMm : CBX_ROOT_DEFAULTS.diameterMm,
-    diskHeightMm: Number.isFinite(r.diskHeightMm) ? r.diskHeightMm : CBX_ROOT_DEFAULTS.diskHeightMm,
-    coneHeightMm: Number.isFinite(r.coneHeightMm) ? r.coneHeightMm : CBX_ROOT_DEFAULTS.coneHeightMm,
+    diameterMm: finiteOr(r.diameterMm, CBX_ROOT_DEFAULTS.diameterMm),
+    diskHeightMm: finiteOr(r.diskHeightMm, CBX_ROOT_DEFAULTS.diskHeightMm),
+    coneHeightMm: finiteOr(r.coneHeightMm, CBX_ROOT_DEFAULTS.coneHeightMm),
   };
 }
 
 function resolveShaftDefaults(settings?: SupportSettings): typeof CBX_SHAFT_DEFAULTS {
-  const sh = (settings as any)?.shaft;
+  const sh = settings?.shaft;
   if (!sh) return CBX_SHAFT_DEFAULTS;
   return {
-    diameterMm: Number.isFinite(sh.diameterMm) ? sh.diameterMm : CBX_SHAFT_DEFAULTS.diameterMm,
+    diameterMm: finiteOr(sh.diameterMm, CBX_SHAFT_DEFAULTS.diameterMm),
   };
 }
 
@@ -1281,8 +1275,8 @@ export class CbxConverter {
         // Over-long: rebuild as a Branch. Re-solve a short native cone + socket from
         // the knot toward the contact, so the cone is a short tip and the shaft
         // carries the rest.
-        const shaftDia = (cc.profile as any)?.bodyDiameterMm
-          ? Math.max((cc.profile as any).bodyDiameterMm, 0.8)
+        const shaftDia = cc.profile?.bodyDiameterMm
+          ? Math.max(cc.profile.bodyDiameterMm, 0.8)
           : 0.8;
         const assembly = createContactAssembly(
           { id: uuidv4(), base: { x: knot.pos.x, y: knot.pos.y, z: knot.pos.z }, tip: { x: cc.pos.x, y: cc.pos.y, z: cc.pos.z } },

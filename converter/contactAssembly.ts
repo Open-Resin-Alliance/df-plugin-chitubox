@@ -5,7 +5,7 @@ import { Joint, Vec3 } from '@/supports/types';
 import { getJointDiameter } from '@/supports/constants';
 import { calculateSmoothedNormal } from '@/supports/PlacementLogic/PlacementUtils';
 import { calculateDiskThickness } from '@/supports/SupportPrimitives/ContactDisk/contactDiskUtils';
-import { CbxContactInput } from './types';
+import { CbxContactInput, CbxTipDefaults, CbxTipSettings } from './types';
 
 /**
  * Builds a contact-cone and socket-joint pair for a converted support endpoint,
@@ -24,8 +24,8 @@ export function createContactAssembly(
   s: CbxContactInput,
   tipWorld: THREE.Vector3,
   startPos: Vec3,
-  tipSettings: any,
-  tipDefaults: any,
+  tipSettings: CbxTipSettings | null | undefined,
+  tipDefaults: CbxTipDefaults,
   mesh?: THREE.Mesh,
   preferAuthoredNormal: boolean = false,
   strictAuthoredCoordinates: boolean = false,
