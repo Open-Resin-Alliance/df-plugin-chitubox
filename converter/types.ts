@@ -64,6 +64,14 @@ export const CBX_TIP_DEFAULTS = {
 
 export type CbxTipDefaults = typeof CBX_TIP_DEFAULTS;
 
+/** The tip measurements the converter reads off a Cbx tip. All optional: Cbx
+ *  omits any of them, and the caller falls back to CbxTipDefaults. */
+export interface CbxTipSettings {
+  length?: number;
+  diameter?: number;
+  pointDiameter?: number;
+}
+
 /**
  * Fallback root/shaft defaults, sourced from settings rather than the file.
  * Cbx's skate radius is deliberately not used as the pad diameter: the plate

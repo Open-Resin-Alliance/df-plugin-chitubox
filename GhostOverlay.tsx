@@ -20,22 +20,24 @@ import { CbxConverter, CbxModelInput } from './CbxConverter';
  */
 
 interface GhostOverlayProps {
-  data: any;
+  data: unknown;
   visible: boolean;
 }
 
 /** Type guard: already-converted import format. */
-function isImportFormat(d: any): d is DragonfruitImportFormat {
-  return !!d && Array.isArray(d.trunks) && Array.isArray(d.roots);
+function isImportFormat(d: unknown): d is DragonfruitImportFormat {
+  const o = d as Partial<DragonfruitImportFormat> | null;
+  return !!o && Array.isArray(o.trunks) && Array.isArray(o.roots);
 }
 
 /** Type guard: a parsed model bundle the converter can consume. */
-function isModelInput(d: any): d is CbxModelInput {
-  return !!d && Array.isArray(d.supports) && typeof d.index !== 'undefined';
+function isModelInput(d: unknown): d is CbxModelInput {
+  const o = d as Partial<CbxModelInput> | null;
+  return !!o && Array.isArray(o.supports) && typeof o.index !== 'undefined';
 }
 
 /** Normalize whatever the host passes into a single import-format payload. */
-function toImportFormat(data: any): DragonfruitImportFormat | null {
+function toImportFormat(data: unknown): DragonfruitImportFormat | null {
   if (!data) return null;
 
   if (isImportFormat(data)) return data;
@@ -65,8 +67,9 @@ function toImportFormat(data: any): DragonfruitImportFormat | null {
   }
 
   // A parsed container with a `.models` array.
-  if (data && Array.isArray(data.models) && data.models.every(isModelInput)) {
-    return toImportFormat(data.models);
+  const container = data as { models?: unknown } | null;
+  if (container && Array.isArray(container.models) && container.models.every(isModelInput)) {
+    return toImportFormat(container.models);
   }
 
   console.warn('[cbx-ghost] Unrecognized overlay data shape; nothing to render.');

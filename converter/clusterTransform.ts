@@ -4,7 +4,6 @@
  * root-seating walks live side by side — keeping them together makes it obvious
  * when a primitive type (e.g. leaves) is missing from one walk but not another.
  */
-import * as THREE from 'three';
 import { DragonfruitImportFormat, Joint, Segment, Vec3 } from '@/supports/types';
 import { CbxSupport, CbxModelInput } from './types';
 

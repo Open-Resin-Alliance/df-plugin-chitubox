@@ -7,10 +7,9 @@ import * as THREE from 'three';
 import { Vec3, Knot, Joint, Segment, Branch, Leaf, Trunk } from '@/supports/types';
 import { getJointDiameter } from '@/supports/constants';
 import { recomputeLeafContactConeAxisAndLength } from '@/supports/state';
-import { ContactCone } from '@/supports/SupportPrimitives/ContactCone/types';
 import { createContactAssembly } from './contactAssembly';
 import { v4 as uuidv4 } from 'uuid';
-import { CbxTip, CbxTipDefaults, CBX_TIP_DEFAULTS, CBX_DEBUG, cbxDebug } from './types';
+import { CbxContactInput, CbxTip, CbxTipSettings, CBX_TIP_DEFAULTS, CBX_DEBUG, cbxDebug } from './types';
 
 export function normalizeVec(v: Vec3): Vec3 {
   const len = Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
@@ -20,7 +19,7 @@ export function normalizeVec(v: Vec3): Vec3 {
 
 /** Synthetic input for createContactAssembly. Cbx authors no tip normal, so the
  *  helper takes its geometric socket-solve path. */
-export function synthSupportForTip(tip: CbxTip, attachPos: Vec3): any {
+export function synthSupportForTip(tip: CbxTip, attachPos: Vec3): CbxContactInput {
   return {
     id: 'chitubox-synth',
     base: { x: attachPos.x, y: attachPos.y, z: attachPos.z },
@@ -43,7 +42,7 @@ export function synthSupportForTip(tip: CbxTip, attachPos: Vec3): any {
  *
  * @param shaftMm  the shaft/pillar diameter this tip grows from.
  */
-export function synthTipSettings(tip: CbxTip, shaftMm: number): any {
+export function synthTipSettings(tip: CbxTip, shaftMm: number): CbxTipSettings {
   return {
     length: Number.isFinite(tip.length) && tip.length > 0 ? tip.length : undefined,
     diameter: shaftMm,
@@ -308,7 +307,7 @@ export function applyTrunkDiameterProfile(
 
   // 2) Bottom-up running max diameter.
   const contactDemand = (() => {
-    const p = trunk.contactCone?.profile as any;
+    const p = trunk.contactCone?.profile;
     const coneDemand = p ? Math.max(p.bodyDiameterMm ?? 0, p.contactDiameterMm ?? 0) : 0;
     return Math.max(trunk.baseDiameterMm ?? 0, coneDemand);
   })();

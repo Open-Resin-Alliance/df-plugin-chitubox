@@ -1,5 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
+import fs from 'node:fs';
+import path from 'node:path';
 import { CbxParser } from './CbxParser';
 
 /**
@@ -221,8 +223,6 @@ describe('CbxParser.parseBuffer — chain model', () => {
  * Auto-skips when the fixture cannot be found.
  */
 describe('CbxParser real-file regression (SPOTLIGHT.chitubox)', () => {
-  const fs = require('node:fs') as typeof import('node:fs');
-  const path = require('node:path') as typeof import('node:path');
   const candidates = [
     path.join(__dirname, 'SPOTLIGHT.chitubox'),
     ...(process.env.CBX_FIXTURES ?? '')
@@ -270,10 +270,10 @@ describe('CbxParser real-file regression (SPOTLIGHT.chitubox)', () => {
     assert.equal(totalTips, GROUND_TRUTH.tipCount, 'total tip count');
 
     // Match each expected support to a parsed one by its (sorted) tip contact Zs.
-    const normParsed = (s: any) =>
-      s.tips.map((t: any) => Math.round(t.contactZ * 1000)).sort((a: number, b: number) => a - b).join(',');
-    const normExpected = (s: any) =>
-      s.tips.map((t: any[]) => Math.round(t[0] * 1000)).sort((a: number, b: number) => a - b).join(',');
+    const normParsed = (s: { tips: { contactZ: number }[] }) =>
+      s.tips.map((t) => Math.round(t.contactZ * 1000)).sort((a, b) => a - b).join(',');
+    const normExpected = (s: { tips: number[][] }) =>
+      s.tips.map((t) => Math.round(t[0] * 1000)).sort((a, b) => a - b).join(',');
     const expectedKeys = GROUND_TRUTH.supports.map(normExpected).sort();
     const gotKeys = supports.map(normParsed).sort();
     assert.deepEqual(gotKeys, expectedKeys, 'support→tip grouping must match');
