@@ -17,21 +17,54 @@ export function normalizeVec(v: Vec3): Vec3 {
   return { x: v.x / len, y: v.y / len, z: v.z / len };
 }
 
+/**
+ * The contact point to build geometry at, in world space.
+ *
+ * CHITUBOX stores the contact already driven `contactDepth` into the model, so
+ * it is backed out along the cone's own axis to sit on the surface.
+ */
+export function surfaceContact(tip: CbxTip, contactWorld: THREE.Vector3): THREE.Vector3 {
+  const depth = tip.contactDepth;
+  if (!Number.isFinite(depth) || depth <= 0) return contactWorld.clone();
+  const axis = new THREE.Vector3(
+    tip.socketX - tip.x,
+    tip.socketY - tip.y,
+    tip.attachZ - tip.contactZ,
+  );
+  if (axis.lengthSq() < 1e-12) return contactWorld.clone();
+  return contactWorld.clone().addScaledVector(axis.normalize(), depth);
+}
+
 /** Synthetic input for createContactAssembly. Cbx authors no tip normal, so the
  *  helper takes its geometric socket-solve path. */
-export function synthSupportForTip(tip: CbxTip, attachPos: Vec3): CbxContactInput {
+export function synthSupportForTip(tip: CbxTip, attachPos: Vec3, contact?: THREE.Vector3): CbxContactInput {
+  const tipPos = contact ?? surfaceContact(tip, new THREE.Vector3(tip.x, tip.y, tip.contactZ));
   return {
     id: 'chitubox-synth',
     base: { x: attachPos.x, y: attachPos.y, z: attachPos.z },
-    tip: { x: tip.x, y: tip.y, z: tip.contactZ },
+    tip: { x: tipPos.x, y: tipPos.y, z: tipPos.z },
     settings: undefined,
   };
+}
+
+/** How much of the shaft a taperless contact is narrowed to. */
+const UNTAPERED_CONTACT_RATIO = 0.6;
+
+/**
+ * The contact diameter to build a cone with. A contact authored at the shaft
+ * width carries no taper, so it narrows and the socket joint has something to
+ * sit over; the cone keeps its authored length and axis.
+ */
+function contactDiameterFor(tip: CbxTip, shaftMm: number): number | undefined {
+  if (!Number.isFinite(tip.contactDiameter)) return undefined;
+  if (!Number.isFinite(shaftMm) || tip.contactDiameter < shaftMm) return tip.contactDiameter;
+  return shaftMm * UNTAPERED_CONTACT_RATIO;
 }
 
 /**
  * tipSettings for createContactAssembly.
  *   length        <- authored cone length.
- *   pointDiameter <- authored contactDiameter, never defaulted.
+ *   pointDiameter <- authored contactDiameter, narrowed when it carries no taper.
  *   diameter      <- the SHAFT diameter this tip grows from, not the authored
  *                    body diameter.
  *
@@ -46,7 +79,7 @@ export function synthTipSettings(tip: CbxTip, shaftMm: number): CbxTipSettings {
   return {
     length: Number.isFinite(tip.length) && tip.length > 0 ? tip.length : undefined,
     diameter: shaftMm,
-    pointDiameter: Number.isFinite(tip.contactDiameter) ? tip.contactDiameter : undefined,
+    pointDiameter: contactDiameterFor(tip, shaftMm),
   };
 }
 
@@ -77,10 +110,11 @@ export function buildTipFromKnot(
   mesh?: THREE.Mesh,
   forceLeaf = false,
 ): { leaf?: Leaf; branch?: Branch } {
+  const contact = surfaceContact(tip, contactWorld);
   const knotToContact = Math.hypot(
-    contactWorld.x - knotPos.x,
-    contactWorld.y - knotPos.y,
-    contactWorld.z - knotPos.z,
+    contact.x - knotPos.x,
+    contact.y - knotPos.y,
+    contact.z - knotPos.z,
   );
   const nativeTipLen = tipDefaults.lengthMm;
   const shaftLength = knotToContact - nativeTipLen;
@@ -90,12 +124,12 @@ export function buildTipFromKnot(
   // shaft). For a leaf, the cone spans the whole authored distance from the knot.
   // Body diameter follows the shaft (see synthTipSettings) in both cases.
   const tipSettingsForCone = asBranch
-    ? { length: nativeTipLen, diameter: shaftDiameter, pointDiameter: tip.contactDiameter }
+    ? { length: nativeTipLen, diameter: shaftDiameter, pointDiameter: contactDiameterFor(tip, shaftDiameter) }
     : synthTipSettings(tip, shaftDiameter);
 
   const assembly = createContactAssembly(
-    synthSupportForTip(tip, knotPos),
-    contactWorld,
+    synthSupportForTip(tip, knotPos, contact),
+    contact,
     knotPos,
     tipSettingsForCone,
     tipDefaults,
@@ -183,9 +217,10 @@ export function buildNativeBranch(
     diameter: tipDefaults.bodyDiameterMm,
     pointDiameter: tipDefaults.contactDiameterMm,
   };
+  const contact = surfaceContact(tip, contactWorld);
   const { socketJoint, contactCone } = createContactAssembly(
-    synthSupportForTip(tip, knotPos),
-    contactWorld,
+    synthSupportForTip(tip, knotPos, contact),
+    contact,
     knotPos,
     tipSettings,
     tipDefaults,
