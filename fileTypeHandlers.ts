@@ -37,7 +37,7 @@ export type CbxImportPayload = {
    * this to label the imported object; without it the host falls back to the
    * project filename plus a numeric suffix (e.g. "guns (2)").
    */
-  name: string;
+  objName: string;
   geometry: THREE.BufferGeometry;
   transform: {
     position: THREE.Vector3;
@@ -232,7 +232,7 @@ function convertSingleModel(
 
   return {
     modelId: importedModelId,
-    name: deriveModelName(model.filename, model.index),
+    objName: deriveModelName(model.filename, model.index),
     geometry,
     transform,
     supportData: dragonfruitData,
@@ -277,7 +277,7 @@ async function importParsedProject(parsed: {
     // Best-effort empty payload so the importer can surface a clean state.
     return {
       modelId: uuidv4(),
-      name: 'model_1',
+      objName: 'model_1',
       geometry: new THREE.BufferGeometry(),
       transform: {
         position: new THREE.Vector3(0, 0, 0),
@@ -301,6 +301,7 @@ async function importParsedProject(parsed: {
     console.log('[chitubox-import][debug] multi-model payloads generated', {
       payloadCount: payloads.length,
       modelIds: payloads.map((p) => p.modelId),
+      objNames: payloads.map((p) => p.objName ?? '(none)'),
       supportSummaries: payloads.map((p) => ({
         modelId: p.modelId,
         ...summarizeImportSupportData(p.supportData),
@@ -318,6 +319,7 @@ async function importParsedProject(parsed: {
 
   console.log('[chitubox-import][debug] single-model payload generated', {
     modelId: payload.modelId,
+    objName: payload.objName ?? '(none)',
     supportSummary: summarizeImportSupportData(payload.supportData),
   });
 
