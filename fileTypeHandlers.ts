@@ -31,13 +31,8 @@ import { initializeBVH, accelerateGeometry, disposeGeometryBVH } from '@/utils/b
  */
 export type CbxImportPayload = {
   modelId: string;
-  /**
-   * Display name for this model, derived from the per-model filename stored in
-   * the .chitubox container (extension stripped). The host scene manager uses
-   * this to label the imported object; without it the host falls back to the
-   * project filename plus a numeric suffix (e.g. "guns (2)").
-   */
-  name: string;
+  /** The container's per-model filename; omitted when it has none. */
+  objName?: string;
   geometry: THREE.BufferGeometry;
   transform: {
     position: THREE.Vector3;
@@ -232,23 +227,11 @@ function convertSingleModel(
 
   return {
     modelId: importedModelId,
-    name: deriveModelName(model.filename, model.index),
+    objName: model.filename?.trim() || undefined,
     geometry,
     transform,
     supportData: dragonfruitData,
   };
-}
-
-/**
- * Build a display name for an imported model from its container filename.
- * Strips a trailing 3D-model extension (.stl/.obj/.ply/.3mf) so the host shows
- * the bare model name rather than one ending in .stl. Falls back to an indexed
- * generic name when the container has no filename for this instance.
- */
-function deriveModelName(filename: string | null | undefined, index: number): string {
-  const raw = (filename ?? '').trim();
-  if (!raw) return `model_${index + 1}`;
-  return raw.replace(/\.(stl|obj|ply|3mf)$/i, '');
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +260,6 @@ async function importParsedProject(parsed: {
     // Best-effort empty payload so the importer can surface a clean state.
     return {
       modelId: uuidv4(),
-      name: 'model_1',
       geometry: new THREE.BufferGeometry(),
       transform: {
         position: new THREE.Vector3(0, 0, 0),
